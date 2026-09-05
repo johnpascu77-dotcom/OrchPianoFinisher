@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OrchPiano Finisher - Phase 1 (merge only, no dynamics).
+"""OrchPiano Finisher - Phase 1 (merge) + Phase 2 (playability safety net).
 
 Merges OrchPiano's 4-channel Reduce output (captured via OrchCapture) onto a
 2-staff grand-staff MusicXML score, using OrchPiano's own channel->role
@@ -13,14 +13,23 @@ Channel offsets from OrchPiano's chanBase (see OrchPianoProcessor.cpp
     +2  LH secondary   -> LH staff, voice 2
     +3  LH lead/bass   -> LH staff, voice 1
 
-Scope (see Docs/OrchPianoFinisher_Design.md): this phase only merges and
-writes notation. It does NOT re-decide melody/bass/hand assignment, does not
-add dynamics, and does not run the cross-hand/cross-onset overlap safety net
-planned for Phase 2 - it has a narrow staggered-overlap guard only (see
-_guard_staggered_overlaps), which is not a substitute for that later work.
-Same-onset chords on the lead voice (voice 1 is NOT monophonic - it carries
-whatever streamHandVoices() didn't peel off as the secondary voice) are
-notated as real chords, never mistaken for overlaps.
+Scope (see Docs/OrchPianoFinisher_Design.md): this tool packages OrchPiano's
+own decision into notation. It does NOT re-decide melody/bass/hand
+assignment or note content, does not add dynamics (Phase 3).
+
+Phase 2 (this file, see design doc's 2026-09-05 scope-gap finding): OrchPiano's own
+per-hand span/voice-count check inside reduceHand() only ever evaluates one
+onset group's own snapshot - it has no way to see that a still-sustaining
+note from an earlier onset group, recombined with a brand-new attack, can
+push what's REALLY sounding in one hand past its own limits even though each
+attack was individually fine. _guard_hand_playability walks real note timing
+(not the onset-group abstraction) per hand and enforces span/count directly;
+_report_hand_crossing flags (never auto-fixes) real hand-crossing, since
+deciding whether a crossing passage is a genuine musical gesture needs a
+human ear. _guard_staggered_overlaps remains a narrower, separate hygiene
+pass within one voice line. Same-onset chords on the lead voice (voice 1 is
+NOT monophonic - it carries whatever streamHandVoices() didn't peel off as
+the secondary voice) are notated as real chords, never mistaken for overlaps.
 """
 
 from __future__ import annotations
@@ -38,6 +47,8 @@ CHANNEL_ROLE = {
     2: ("LH", 2),
     3: ("LH", 1),
 }
+
+HAND_OF = {offset: staff for offset, (staff, _voice) in CHANNEL_ROLE.items()}
 
 
 @dataclass
@@ -148,6 +159,123 @@ def extract_notes(track, channel_base: int | None) -> tuple[list[RawNote], int]:
 
     raw_notes.sort(key=lambda n: (n.start_tick, n.channel_offset, n.pitch))
     return raw_notes, channel_base
+
+
+def _guard_hand_playability(notes: list[RawNote], max_span: int, max_notes: int) -> None:
+    """Phase 2 safety net (see module docstring). Per hand (both voice
+    channels combined - they sound on the same physical hand), sweeps real
+    note timing and enforces `max_span` (semitones) and `max_notes`
+    (simultaneous notes) directly against whatever is ACTUALLY sounding at
+    each new attack, not against any single onset group's own view of
+    itself. When a new attack would push the hand over either limit, the
+    conflicting older note(s) are truncated to end at that attack - same
+    "favor the newer attack, shorten the older sustain" rule already used by
+    _guard_staggered_overlaps, just applied across both of a hand's voices
+    together instead of within one voice line. A span violation removes
+    whichever extreme (top or bottom) note shrinks the span more; a
+    count-only violation removes the oldest-started note. Mutates in place.
+
+    `max_span`/`max_notes` are the caller's assumption about what OrchPiano's
+    "Max Hand Span"/"Notes / Hand (Reduce)" were set to for this take - the
+    captured MIDI carries no record of the plugin's own parameter state.
+    """
+    by_hand: dict[str, list[RawNote]] = {"RH": [], "LH": []}
+    for n in notes:
+        by_hand[HAND_OF[n.channel_offset]].append(n)
+
+    span_truncated = 0
+    count_truncated = 0
+    for hand_notes in by_hand.values():
+        hand_notes.sort(key=lambda n: n.start_tick)
+        active: list[RawNote] = []
+        for n in hand_notes:
+            active = [a for a in active if a.end_tick > n.start_tick]
+            active.append(n)
+            while True:
+                pitches = [a.pitch for a in active]
+                span = (max(pitches) - min(pitches)) if len(active) > 1 else 0
+                over_span = span > max_span
+                over_count = len(active) > max_notes
+                if not (over_span or over_count):
+                    break
+                candidates = [a for a in active if a is not n]
+                if not candidates:
+                    break  # the new note alone already violates - nothing left to trim
+                if over_span:
+                    # hi/lo are extremes of the WHOLE active set (candidates
+                    # + the just-added n) - one of them may be n's own
+                    # pitch, which candidates can't supply as a victim, so
+                    # only compare removal options that candidates can
+                    # actually satisfy.
+                    hi, lo = max(pitches), min(pitches)
+                    hi_ok = any(a.pitch == hi for a in candidates)
+                    lo_ok = any(a.pitch == lo for a in candidates)
+                    if hi_ok and lo_ok:
+                        without_hi = [a for a in candidates if a.pitch != hi]
+                        without_lo = [a for a in candidates if a.pitch != lo]
+                        def span_of(lst):
+                            ps = [a.pitch for a in lst]
+                            return (max(ps) - min(ps)) if len(ps) > 1 else 0
+                        target = hi if span_of(without_hi) <= span_of(without_lo) else lo
+                    elif hi_ok:
+                        target = hi
+                    else:
+                        target = lo
+                    victim = next(a for a in candidates if a.pitch == target)
+                    span_truncated += 1
+                else:
+                    victim = min(candidates, key=lambda a: a.start_tick)
+                    count_truncated += 1
+                victim.end_tick = min(victim.end_tick, n.start_tick)
+                active.remove(victim)
+    if span_truncated:
+        print(f"NOTE: truncated {span_truncated} note(s) to keep the real (cross-attack) "
+              f"hand span <= {max_span} semitones.", file=sys.stderr)
+    if count_truncated:
+        print(f"NOTE: truncated {count_truncated} note(s) to keep the real (cross-attack) "
+              f"hand note-count <= {max_notes}.", file=sys.stderr)
+
+
+def _report_hand_crossing(notes: list[RawNote], ticks_per_beat: int) -> None:
+    """Phase 2, flag-only (see module docstring): reports total time the two
+    hands' real sounding ranges cross (LH's highest note above RH's lowest)
+    and the first few instances by beat position. Never truncates or drops a
+    note over this - OrchPiano's own crossoverSlack already permits brief,
+    legitimate crossing at the hand-split boundary, and a longer/deeper one
+    found here could be a genuine musical gesture (or a real problem) -
+    that call needs a human ear, not a heuristic."""
+    events = []  # (tick, is_release, hand, pitch) - releases sort before attacks at the same tick
+    for n in notes:
+        hand = HAND_OF[n.channel_offset]
+        events.append((n.start_tick, 0, hand, n.pitch))
+        events.append((n.end_tick, 1, hand, n.pitch))
+    events.sort(key=lambda e: (e[0], e[1]))
+
+    active = {"RH": set(), "LH": set()}
+    crossing_ticks = 0
+    was_crossing = False
+    prev_tick = None
+    first_instances: list[int] = []
+
+    for tick, is_release, hand, pitch in events:
+        if was_crossing and prev_tick is not None and tick > prev_tick:
+            crossing_ticks += tick - prev_tick
+        if is_release:
+            active[hand].discard(pitch)
+        else:
+            active[hand].add(pitch)
+        is_crossing = bool(active["RH"]) and bool(active["LH"]) and min(active["RH"]) < max(active["LH"])
+        if is_crossing and not was_crossing and len(first_instances) < 5:
+            first_instances.append(tick)
+        was_crossing = is_crossing
+        prev_tick = tick
+
+    if crossing_ticks > 0:
+        beats = [round(t / ticks_per_beat, 2) for t in first_instances]
+        print(f"NOTE: hands cross (a LH note sounds above RH's lowest concurrent note) for "
+              f"{round(crossing_ticks / ticks_per_beat, 2)} beat(s) total across the take; "
+              f"first instance(s) at beat {beats} - review in Dorico, NOT auto-corrected.",
+              file=sys.stderr)
 
 
 def _group_by_line_and_onset(notes: list[RawNote]) -> dict[tuple[str, int], list[list[RawNote]]]:
@@ -281,6 +409,12 @@ def main():
                      help="0-indexed base channel (OrchPiano's chanBase - 1). Default: auto-detect as the lowest channel used on the track.")
     ap.add_argument("--time-signature", default="4/4",
                      help="Time signature for notation purposes (default 4/4) - OrchPiano's captured MIDI carries no time-signature meta event.")
+    ap.add_argument("--max-hand-span", type=int, default=14,
+                     help="Assumed OrchPiano 'Max Hand Span (st)' for this take, in semitones (default 14, OrchPiano's own default). "
+                          "Phase 2 enforces this against real overlapping note timing, not just each onset group's own snapshot.")
+    ap.add_argument("--max-hand-notes", type=int, default=4,
+                     help="Assumed OrchPiano 'Notes / Hand (Reduce)' for this take (default 4, OrchPiano's own default). "
+                          "Enforced the same way as --max-hand-span.")
     args = ap.parse_args()
 
     mid = mido.MidiFile(args.input_mid)
@@ -288,6 +422,9 @@ def main():
     raw_notes, channel_base = extract_notes(track, args.channel_base)
     print(f"Read {len(raw_notes)} notes from channel-base {channel_base} "
           f"(1-indexed MIDI ch {channel_base + 1}..{channel_base + 4}).")
+
+    _guard_hand_playability(raw_notes, args.max_hand_span, args.max_hand_notes)
+    _report_hand_crossing(raw_notes, mid.ticks_per_beat)
 
     grouped = _group_by_line_and_onset(raw_notes)
     _guard_staggered_overlaps(grouped)
