@@ -386,6 +386,16 @@ def build_score(grouped: dict[tuple[str, int], list[list[RawNote]]], ticks_per_b
         p.quantize(inPlace=True, recurse=True)
         p.makeRests(inPlace=True, fillGaps=True, hideRests=False)
         p.makeMeasures(inPlace=True)
+        # makeMeasures alone does NOT split a note that runs past its
+        # measure's end into tied fragments - it can leave a single
+        # over-long duration sitting in the measure where the note starts.
+        # Confirmed by direct inspection: without this call, a real 4.5-beat
+        # note (crossing two barlines) survived intact right after
+        # makeMeasures but vanished by the time the MusicXML was re-parsed -
+        # found by checking the actual data at each pipeline stage, not by
+        # trusting a clean run. makeTies splits it into proper tied
+        # fragments, one per measure, that MusicXML can actually represent.
+        p.makeTies(inPlace=True)
         score.insert(0, p)
 
     present_parts = list(score.parts)
