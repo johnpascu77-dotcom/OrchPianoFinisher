@@ -15,7 +15,17 @@ Channel offsets from OrchPiano's chanBase (see OrchPianoProcessor.cpp
 
 Scope (see Docs/OrchPianoFinisher_Design.md): this tool packages OrchPiano's
 own decision into notation. It does NOT re-decide melody/bass/hand
-assignment or note content, does not add dynamics (Phase 3).
+assignment or note content.
+
+Phase 3 (dynamics, this file): derives <dynamics> marks from note velocity,
+not the CC11 that rides through OrchPiano's Reduce mode untouched from
+whichever of up to ~25 merged orchestral tracks happened to still be
+sounding (see design doc SS3) - not a coherent "how loud is the reduction"
+signal. Velocity IS something OrchPiano actually controls (dynamicRecoveryScale
+boosts a thinned chord to preserve perceived loudness), so it already
+reflects the reduction's own judgment; compute_dynamics_marks buckets it into
+pp/p/mp/mf/f/ff with simple hysteresis (a bucket only commits once the next
+onset confirms it) so a single outlier chord doesn't produce a spurious mark.
 
 Phase 2 (this file, see design doc's 2026-09-05 scope-gap finding): OrchPiano's own
 per-hand span/voice-count check inside reduceHand() only ever evaluates one
@@ -39,7 +49,12 @@ import sys
 from dataclasses import dataclass
 
 import mido
-from music21 import chord, clef, instrument, layout, meter, note, stream
+from music21 import chord, clef, dynamics, instrument, layout, meter, note, stream
+
+# Roughly equal 1-127 splits into the 6 dynamics the design doc settled on
+# (SS3) - not a claim that real dynamics are evenly spaced, just a simple,
+# defensible default until real-take testing shows otherwise.
+DYNAMIC_BUCKETS = [(21, "pp"), (42, "p"), (63, "mp"), (84, "mf"), (105, "f"), (127, "ff")]
 
 CHANNEL_ROLE = {
     0: ("RH", 1),
@@ -278,6 +293,62 @@ def _report_hand_crossing(notes: list[RawNote], ticks_per_beat: int) -> None:
               file=sys.stderr)
 
 
+def _velocity_bucket(velocity: int) -> str:
+    for threshold, label in DYNAMIC_BUCKETS:
+        if velocity <= threshold:
+            return label
+    return DYNAMIC_BUCKETS[-1][1]
+
+
+def compute_dynamics_marks(notes: list[RawNote], ticks_per_beat: int,
+                           min_hold_beats: float = 1.0) -> list[tuple[float, str]]:
+    """Phase 3 (see module docstring): one velocity-derived dynamics mark per
+    genuine, held level change - not per chord, and not per hand (a piano
+    dynamic mark applies to the whole instrument). At every distinct onset
+    tick across ALL 4 channels, buckets the average velocity of whatever
+    attacks at that instant into pp/p/mp/mf/f/ff.
+
+    Hysteresis: a new bucket only commits once it holds continuously for at
+    least `min_hold_beats` (or runs to the end of the piece) - checked
+    empirically, not assumed: a single extra-onset confirmation was NOT
+    enough. Real velocity often sits right at a bucket boundary and jitters
+    across it beat-to-beat in a fast passage (observed: 11 bucket flips
+    across 12 beats on real data with a 1-onset confirmation), which is
+    exactly the "marking every chord" clutter this was supposed to prevent,
+    just one onset later. Requiring a real time span filters that out while
+    still catching genuine phrase-level dynamic shifts. A short run that
+    doesn't hold long enough is skipped entirely (not merged into neighbors)
+    rather than guessed at. Returns (offset_in_quarterLength, label) pairs
+    at commit points only."""
+    by_tick: dict[int, list[int]] = {}
+    for n in notes:
+        by_tick.setdefault(n.start_tick, []).append(n.velocity)
+
+    ticks = sorted(by_tick)
+    buckets = [_velocity_bucket(round(sum(by_tick[t]) / len(by_tick[t]))) for t in ticks]
+    min_hold_ticks = min_hold_beats * ticks_per_beat
+
+    marks: list[tuple[float, str]] = []
+    committed = None
+    i, n = 0, len(buckets)
+    while i < n:
+        b = buckets[i]
+        if b == committed:
+            i += 1
+            continue
+        j = i
+        while j < n and buckets[j] == b:
+            j += 1
+        holds_long_enough = (j == n) or (ticks[j - 1] - ticks[i] >= min_hold_ticks)
+        if holds_long_enough:
+            marks.append((ticks[i] / ticks_per_beat, b))
+            committed = b
+            i = j
+        else:
+            i += 1
+    return marks
+
+
 def _group_by_line_and_onset(notes: list[RawNote]) -> dict[tuple[str, int], list[list[RawNote]]]:
     """Bucket notes into (RH/LH, voice-number) lines, then within each line
     into onset-groups: notes sharing an exact start_tick are one attack (a
@@ -369,7 +440,7 @@ def _guard_staggered_overlaps(grouped: dict[tuple[str, int], list[list[RawNote]]
 
 
 def build_score(grouped: dict[tuple[str, int], list[list[RawNote]]], ticks_per_beat: int,
-                time_sig: str) -> stream.Score:
+                time_sig: str, dynamics_marks: list[tuple[float, str]] = ()) -> stream.Score:
     score = stream.Score()
 
     # PartStaff (not plain Part) + a braced StaffGroup with barTogether=True is
@@ -413,6 +484,13 @@ def build_score(grouped: dict[tuple[str, int], list[list[RawNote]]], ticks_per_b
 
     for (staff, voice_num), v in sorted(voices.items(), key=lambda kv: (kv[0][0], kv[0][1])):
         parts[staff].insert(0, v)
+
+    # Dynamics apply to the whole piano, not one hand - convention puts the
+    # mark under the bass (LH) staff. Fall back to RH only if this take has
+    # nothing on LH at all (a Hands=Right-only run).
+    dynamics_staff = "LH" if any(isinstance(el, stream.Voice) for el in parts["LH"]) else "RH"
+    for offset_ql, label in dynamics_marks:
+        parts[dynamics_staff].insert(offset_ql, dynamics.Dynamic(label))
 
     for staff in ("RH", "LH"):
         p = parts[staff]
@@ -467,6 +545,8 @@ def main():
     ap.add_argument("--max-hand-notes", type=int, default=4,
                      help="Assumed OrchPiano 'Notes / Hand (Reduce)' for this take (default 4, OrchPiano's own default). "
                           "Enforced the same way as --max-hand-span.")
+    ap.add_argument("--no-dynamics", action="store_true",
+                     help="Skip velocity-derived <dynamics> marks (Phase 3). On by default.")
     args = ap.parse_args()
 
     mid = mido.MidiFile(args.input_mid)
@@ -478,11 +558,15 @@ def main():
     _guard_hand_playability(raw_notes, args.max_hand_span, args.max_hand_notes)
     _report_hand_crossing(raw_notes, mid.ticks_per_beat)
 
+    dynamics_marks = [] if args.no_dynamics else compute_dynamics_marks(raw_notes, mid.ticks_per_beat)
+    if dynamics_marks:
+        print(f"Computed {len(dynamics_marks)} dynamics mark(s) from velocity.")
+
     grouped = _group_by_line_and_onset(raw_notes)
     _fix_voice_stem_order(grouped)
     _guard_staggered_overlaps(grouped)
 
-    score = build_score(grouped, mid.ticks_per_beat, args.time_signature)
+    score = build_score(grouped, mid.ticks_per_beat, args.time_signature, dynamics_marks)
     score.write("musicxml", fp=args.output_musicxml)
     print(f"Wrote {args.output_musicxml}")
 
