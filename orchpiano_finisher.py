@@ -27,6 +27,29 @@ reflects the reduction's own judgment; compute_dynamics_marks buckets it into
 pp/p/mp/mf/f/ff with simple hysteresis (a bucket only commits once the next
 onset confirms it) so a single outlier chord doesn't produce a spurious mark.
 
+Notation scale (this file, 2026-09-05): MPL's own step grid is finer than what
+notates cleanly for some pieces (e.g. "Slack Tide"), needing every note value
+doubled to read as 16ths instead of 32nds - previously a manual two-step
+Dorico dance (Requantize to a 32nd/16th-triplet floor, then Write > Edit
+Duration > Double Durations on everything). `--notation-scale 2` replicates
+that exactly via music21's own `Stream.augmentOrDiminish()`, applied AFTER
+quantize() (not before): an earlier attempt scaled the EFFECTIVE ticks-per-
+beat fed into the tick-to-quarterLength conversion instead, reasoning that
+snapping to a grid commutes with a uniform rescale (verified in isolation -
+20,000 random-tick trial, zero mismatches) - but that isolated proof modeled
+quantize() as an independent per-value snap, when music21's real quantize()
+has adaptive look-ahead logic across neighboring notes that does NOT commute
+with a pre-scale the same way. Caught by diffing real output, not trusting
+the isolated proof: many durations came out 3x instead of 2x on an actual
+capture. augmentOrDiminish() sidesteps this entirely by scaling values that
+are ALREADY on a clean grid (multiplying an exact eighth-note or triplet
+value by 2 stays exactly on a - coarser - exact grid), so there is no
+adaptive-quantize interaction to go wrong. Confirmed empirically (not just
+by reading its docstring) that it correctly recurses into nested Voice
+streams AND scales top-level Dynamic marks. Does not touch
+_guard_hand_playability/_guard_staggered_overlaps/_fix_voice_stem_order,
+which all work in raw ticks and stay scale-invariant either way.
+
 Phase 2 (this file, see design doc's 2026-09-05 scope-gap finding): OrchPiano's own
 per-hand span/voice-count check inside reduceHand() only ever evaluates one
 onset group's own snapshot - it has no way to see that a still-sustaining
@@ -440,7 +463,8 @@ def _guard_staggered_overlaps(grouped: dict[tuple[str, int], list[list[RawNote]]
 
 
 def build_score(grouped: dict[tuple[str, int], list[list[RawNote]]], ticks_per_beat: int,
-                time_sig: str, dynamics_marks: list[tuple[float, str]] = ()) -> stream.Score:
+                time_sig: str, dynamics_marks: list[tuple[float, str]] = (),
+                notation_scale: float = 1.0) -> stream.Score:
     score = stream.Score()
 
     # PartStaff (not plain Part) + a braced StaffGroup with barTogether=True is
@@ -504,6 +528,19 @@ def build_score(grouped: dict[tuple[str, int], list[list[RawNote]]], ticks_per_b
         # a display-quantization step, not a musical decision OrchPiano
         # already made - it does not touch pitch, hand, or voice assignment.
         p.quantize(inPlace=True, recurse=True)
+        if notation_scale != 1.0:
+            # AFTER quantize, never before: quantize()'s grid-choice has
+            # adaptive look-ahead across neighboring notes that does not
+            # commute with a pre-scale (confirmed by diffing real output,
+            # not just reasoning about it - see module docstring). Applied
+            # here, every value being scaled is already on a clean grid, so
+            # multiplying by an exact factor stays exactly on a grid too -
+            # no adaptive interaction left to go wrong. music21's own
+            # augmentOrDiminish (verified empirically to recurse into nested
+            # Voice streams and to scale top-level Dynamic marks correctly)
+            # is the "Edit Duration" step of the manual Dorico workflow this
+            # replaces.
+            p.augmentOrDiminish(notation_scale, inPlace=True)
         p.makeRests(inPlace=True, fillGaps=True, hideRests=False)
         p.makeMeasures(inPlace=True)
         # makeMeasures alone does NOT split a note that runs past its
@@ -547,6 +584,13 @@ def main():
                           "Enforced the same way as --max-hand-span.")
     ap.add_argument("--no-dynamics", action="store_true",
                      help="Skip velocity-derived <dynamics> marks (Phase 3). On by default.")
+    ap.add_argument("--notation-scale", type=float, default=1.0,
+                     help="Multiply every notated duration/position by this factor (default 1.0, "
+                          "no change). Use 2.0 when the source's native grid is too fine to read "
+                          "cleanly (e.g. an MPL-driven take, where a 16th-note grid otherwise "
+                          "notates as 32nds) - replaces the manual Dorico Requantize-then-"
+                          "Double-Durations workflow. Does not affect the safety-net guards, "
+                          "which work in raw ticks regardless of this setting.")
     args = ap.parse_args()
 
     mid = mido.MidiFile(args.input_mid)
@@ -558,7 +602,13 @@ def main():
     _guard_hand_playability(raw_notes, args.max_hand_span, args.max_hand_notes)
     _report_hand_crossing(raw_notes, mid.ticks_per_beat)
 
-    dynamics_marks = [] if args.no_dynamics else compute_dynamics_marks(raw_notes, mid.ticks_per_beat)
+    # min_hold_beats is divided by the scale so "holds for 1 beat" still
+    # means one beat of the FINAL, post-scale notation, not one beat of the
+    # denser pre-scale grid - the marks themselves are computed at unscaled
+    # offsets here and get carried along by build_score's augmentOrDiminish
+    # at the end, same as every note.
+    dynamics_marks = [] if args.no_dynamics else compute_dynamics_marks(
+        raw_notes, mid.ticks_per_beat, min_hold_beats=1.0 / args.notation_scale)
     if dynamics_marks:
         print(f"Computed {len(dynamics_marks)} dynamics mark(s) from velocity.")
 
@@ -566,7 +616,8 @@ def main():
     _fix_voice_stem_order(grouped)
     _guard_staggered_overlaps(grouped)
 
-    score = build_score(grouped, mid.ticks_per_beat, args.time_signature, dynamics_marks)
+    score = build_score(grouped, mid.ticks_per_beat, args.time_signature, dynamics_marks,
+                        notation_scale=args.notation_scale)
     score.write("musicxml", fp=args.output_musicxml)
     print(f"Wrote {args.output_musicxml}")
 

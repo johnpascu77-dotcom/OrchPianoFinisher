@@ -14,6 +14,7 @@ from orchpiano_finisher import (
     _fix_voice_stem_order,
     _group_by_line_and_onset,
     compute_dynamics_marks,
+    build_score,
 )
 
 failures = 0
@@ -87,10 +88,46 @@ def test_dynamics_hysteresis_ignores_brief_blip():
           f"dynamics hysteresis: brief blip ignored, genuine change marked (got {marks})")
 
 
+def test_notation_scale_doubles_offsets_and_durations():
+    # 2026-09-05: --notation-scale replicates the manual Dorico "Requantize
+    # then double durations" dance via music21's augmentOrDiminish(), applied
+    # AFTER quantize() rather than by pre-scaling the tick-to-quarterLength
+    # conversion - an earlier pre-scale attempt looked correct in an isolated
+    # simulation but produced wrong (often 3x, not 2x) durations against real
+    # output, because quantize()'s adaptive look-ahead does not commute with
+    # a pre-scale. This builds a real score both ways and diffs the actual
+    # (offset, duration) pairs, not just the ratio.
+    tpb = 960
+    notes = [
+        RawNote(channel_offset=0, pitch=60, velocity=80, start_tick=0, end_tick=tpb),
+        RawNote(channel_offset=0, pitch=64, velocity=80, start_tick=tpb, end_tick=2 * tpb),
+        RawNote(channel_offset=3, pitch=48, velocity=80, start_tick=0, end_tick=2 * tpb),
+    ]
+    grouped = _group_by_line_and_onset(notes)
+
+    unscaled = build_score(grouped, tpb, "4/4", notation_scale=1.0)
+    scaled = build_score(grouped, tpb, "4/4", notation_scale=2.0)
+
+    def offsets_and_durations(score):
+        pairs = []
+        for n in score.flatten().notes:
+            pairs.append((round(float(n.offset), 4), round(float(n.duration.quarterLength), 4)))
+        return sorted(pairs)
+
+    unscaled_pairs = offsets_and_durations(unscaled)
+    scaled_pairs = offsets_and_durations(scaled)
+    doubled_expected = sorted((round(o * 2, 4), round(d * 2, 4)) for o, d in unscaled_pairs)
+
+    check(scaled_pairs == doubled_expected,
+          f"notation scale: every offset/duration doubles exactly (unscaled={unscaled_pairs}, "
+          f"scaled={scaled_pairs}, expected={doubled_expected})")
+
+
 if __name__ == "__main__":
     test_hand_playability_new_note_owns_extreme()
     test_voice_stem_swap_resolves_single_vs_single()
     test_dynamics_hysteresis_ignores_brief_blip()
+    test_notation_scale_doubles_offsets_and_durations()
 
     if failures == 0:
         print("\nAll tests passed.")
