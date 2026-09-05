@@ -223,6 +223,8 @@ def _guard_hand_playability(notes: list[RawNote], max_span: int, max_notes: int)
 
     span_truncated = 0
     count_truncated = 0
+    dropped = 0
+    to_remove: set[int] = set()
     for hand_notes in by_hand.values():
         hand_notes.sort(key=lambda n: n.start_tick)
         active: list[RawNote] = []
@@ -260,18 +262,49 @@ def _guard_hand_playability(notes: list[RawNote], max_span: int, max_notes: int)
                     else:
                         target = lo
                     victim = next(a for a in candidates if a.pitch == target)
-                    span_truncated += 1
                 else:
                     victim = min(candidates, key=lambda a: a.start_tick)
-                    count_truncated += 1
-                victim.end_tick = min(victim.end_tick, n.start_tick)
+                if victim.start_tick >= n.start_tick:
+                    # 2026-09-05: victim shares n's own onset (a genuine
+                    # same-instant chord) - candidates are only ever notes
+                    # already `active` when n was appended, which by
+                    # construction start at or before n, so this is only
+                    # ever equality in practice (the >= is defensive). There
+                    # is no legitimate "shorten to end before it starts"
+                    # resolution for a same-onset sibling; truncating it to
+                    # n.start_tick would make end_tick == start_tick, a
+                    # zero-length ghost note that still silently occupies a
+                    # note-on/off pair downstream. Found by a real cross-
+                    # check: Dorico's own MIDI Import Options reported fewer
+                    # notes (488/272) than write_midi() had actually written
+                    # (505/279) - traced to exactly these phantom notes (44
+                    # of them, both hands combined), present since this
+                    # function's Phase 2 introduction and previously masked
+                    # in the MusicXML path by build_score()'s onset-GROUP
+                    # (not per-note) duration, which a chord's other,
+                    # legitimately-timed members dominated. Drop it outright
+                    # instead of truncating it into existence-in-name-only.
+                    to_remove.add(id(victim))
+                    dropped += 1
+                else:
+                    victim.end_tick = min(victim.end_tick, n.start_tick)
+                    if over_span:
+                        span_truncated += 1
+                    else:
+                        count_truncated += 1
                 active.remove(victim)
+    if to_remove:
+        notes[:] = [n for n in notes if id(n) not in to_remove]
     if span_truncated:
         print(f"NOTE: truncated {span_truncated} note(s) to keep the real (cross-attack) "
               f"hand span <= {max_span} semitones.", file=sys.stderr)
     if count_truncated:
         print(f"NOTE: truncated {count_truncated} note(s) to keep the real (cross-attack) "
               f"hand note-count <= {max_notes}.", file=sys.stderr)
+    if dropped:
+        print(f"NOTE: dropped {dropped} same-onset note(s) that would otherwise have been "
+              "truncated to zero/negative length (a same-instant sibling attack can't be "
+              "\"shortened to end before it starts\").", file=sys.stderr)
 
 
 def _report_hand_crossing(notes: list[RawNote], ticks_per_beat: int) -> None:
@@ -462,6 +495,33 @@ def _guard_staggered_overlaps(grouped: dict[tuple[str, int], list[list[RawNote]]
               "(distinct from same-onset chords, which are never touched here).", file=sys.stderr)
 
 
+def _guard_cross_voice_pitch_overlaps(notes: list[RawNote]) -> int:
+    """Truncate any same-pitch overlap regardless of which voice it came
+    from. _guard_staggered_overlaps only ever checks within one (staff,
+    voice) line; write_midi() merges voice 1 and voice 2 back into one flat
+    polyphonic line per hand for MIDI export, which can expose a genuine
+    CROSS-voice same-pitch collision neither line's own guard would ever
+    see (e.g. voice 1's note still ringing when voice 2 re-attacks the same
+    pitch). Two overlapping note-on events for the same pitch on one MIDI
+    channel are ambiguous - a receiver (Dorico's importer included) can't
+    tell which note-off belongs to which onset, and can silently swallow
+    one of the two notes rather than erroring. Found on a real take
+    ("slack_tide"): Dorico's own MIDI Import Options reported fewer total
+    notes (488/272) than were actually written (505/279) - traced directly
+    to 25 RH / 4 LH such overlaps, not a cosmetic discrepancy. Same policy
+    as the rest of this file: favor the newer attack, truncate the earlier
+    one. Mutates in place, returns the count fixed."""
+    by_pitch: dict[int, RawNote] = {}
+    truncated = 0
+    for n in sorted(notes, key=lambda n: n.start_tick):
+        prev = by_pitch.get(n.pitch)
+        if prev is not None and prev.end_tick > n.start_tick:
+            prev.end_tick = n.start_tick
+            truncated += 1
+        by_pitch[n.pitch] = n
+    return truncated
+
+
 def write_midi(grouped: dict[tuple[str, int], list[list[RawNote]]], ticks_per_beat: int,
                output_path: str, notation_scale: float = 1.0) -> None:
     """Write the corrected (post safety-net) note data as a plain 2-track
@@ -493,21 +553,37 @@ def write_midi(grouped: dict[tuple[str, int], list[list[RawNote]]], ticks_per_be
     """
     out = mido.MidiFile(ticks_per_beat=ticks_per_beat)
     for staff, channel in (("RH", 0), ("LH", 1)):
+        notes: list[RawNote] = []
+        for voice_num in (1, 2):
+            for group in grouped.get((staff, voice_num), []):
+                notes.extend(group)
+        if not notes:
+            # Nothing landed on this hand at all (Hands=Left/Right run) - an
+            # empty staff is legitimate, not an error; just skip the track.
+            continue
+
+        cross_voice_truncated = _guard_cross_voice_pitch_overlaps(notes)
+        if cross_voice_truncated:
+            print(f"NOTE: truncated {cross_voice_truncated} cross-voice same-pitch overlap(s) "
+                  f"on {staff} before MIDI export (voice 1/voice 2 merge can expose these; "
+                  "neither voice's own overlap guard ever sees them alone).", file=sys.stderr)
+
         # (tick, is_note_on, pitch, velocity) - sorting is_note_on False
         # before True at an equal tick lets a note ending exactly when
         # another of the same pitch begins produce a clean off-then-on pair
         # rather than an ambiguous overlap on one MIDI channel.
         events: list[tuple[int, bool, int, int]] = []
-        for voice_num in (1, 2):
-            for group in grouped.get((staff, voice_num), []):
-                for n in group:
-                    start = round(n.start_tick * notation_scale)
-                    end = round(n.end_tick * notation_scale)
-                    events.append((start, True, n.pitch, n.velocity))
-                    events.append((end, False, n.pitch, 0))
+        for n in notes:
+            start = round(n.start_tick * notation_scale)
+            end = round(n.end_tick * notation_scale)
+            if end <= start:
+                # A degenerate zero/negative-length note left behind by the
+                # cross-voice guard truncating right down to its own onset -
+                # nothing audible or notatable to write.
+                continue
+            events.append((start, True, n.pitch, n.velocity))
+            events.append((end, False, n.pitch, 0))
         if not events:
-            # Nothing landed on this hand at all (Hands=Left/Right run) - an
-            # empty staff is legitimate, not an error; just skip the track.
             continue
         events.sort(key=lambda e: (e[0], e[1]))
         track = mido.MidiTrack()

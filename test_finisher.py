@@ -142,6 +142,38 @@ def test_quantize_does_not_invent_tuplets_from_straight_32nd_notes():
           f"spurious tuplets (got {len(rh_notes)} notes, {len(tupleted)} with a tuplet)")
 
 
+def test_hand_playability_same_onset_victim_is_dropped_not_zeroed():
+    # 2026-09-05: found by cross-checking Dorico's own MIDI Import Options
+    # note total against what write_midi() had actually written - Dorico
+    # reported fewer notes (488/272) than were in the file (505/279). Traced
+    # to _guard_hand_playability's truncation line, `victim.end_tick =
+    # min(victim.end_tick, n.start_tick)`: candidates are always notes
+    # already active when n was appended, so victim.start_tick <= n.start_tick
+    # by construction - EXCEPT when victim shares n's own onset (a genuine
+    # same-instant chord), where victim.start_tick == n.start_tick and the
+    # "shorten to end at the new attack" rule sets end_tick == start_tick,
+    # a zero-length ghost note that still silently occupies a note-on/off
+    # pair downstream (write_midi()) or gets masked by chord-level, not
+    # per-note, duration (build_score()'s MusicXML path - why this was never
+    # caught there). Fixed by dropping such a note outright instead of
+    # truncating it into existence-in-name-only.
+    #
+    # Fixture: 5 notes attacking at the SAME instant (tick 0), pitches 60-64
+    # (span 4) against max_span=3 - forces a violation caused purely by the
+    # same-onset chord itself, not by any later attack, the exact shape the
+    # bug needed (a genuinely LATER attack never triggers it - candidates
+    # only ever start at or before the triggering note by construction).
+    notes = [
+        RawNote(channel_offset=0, pitch=60 + i, velocity=80, start_tick=0, end_tick=480)
+        for i in range(5)
+    ]
+    _guard_hand_playability(notes, max_span=3, max_notes=8)
+    check(len(notes) == 4 and all(n.end_tick > n.start_tick for n in notes),
+          f"hand playability: a same-onset over-span note is DROPPED, not left as a "
+          f"zero/negative-length ghost (got {len(notes)} notes, durations "
+          f"{[n.end_tick - n.start_tick for n in notes]})")
+
+
 def test_write_midi_merges_voices_and_scales_ticks():
     # 2026-09-05: added after the user's own direct assessment of real
     # Dorico output - music21's MusicXML writer produced useless cross-staff
@@ -230,6 +262,7 @@ def test_notation_scale_doubles_offsets_and_durations():
 
 if __name__ == "__main__":
     test_hand_playability_new_note_owns_extreme()
+    test_hand_playability_same_onset_victim_is_dropped_not_zeroed()
     test_voice_stem_swap_resolves_single_vs_single()
     test_dynamics_hysteresis_ignores_brief_blip()
     test_quantize_does_not_invent_tuplets_from_straight_32nd_notes()
