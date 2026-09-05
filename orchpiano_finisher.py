@@ -462,6 +462,66 @@ def _guard_staggered_overlaps(grouped: dict[tuple[str, int], list[list[RawNote]]
               "(distinct from same-onset chords, which are never touched here).", file=sys.stderr)
 
 
+def write_midi(grouped: dict[tuple[str, int], list[list[RawNote]]], ticks_per_beat: int,
+               output_path: str, notation_scale: float = 1.0) -> None:
+    """Write the corrected (post safety-net) note data as a plain 2-track
+    Standard MIDI File - one track per hand (RH channel 0, LH channel 1),
+    voice 1 and voice 2 merged back into one polyphonic line per hand -
+    instead of a music21-built MusicXML score.
+
+    2026-09-05: added because music21's MusicXML writer produces genuinely
+    poor engraving for this piano-reduction shape once tested against a real
+    take - useless cross-staff stems, no real up/down-stem voice separation,
+    almost no logical beaming (the user's own direct assessment against real
+    Dorico output, not a subjective guess on my part). The underlying merge
+    (4 channels -> 2 hands, safety-net-corrected note timing) is still the
+    valuable part; music21's own notation choices on top of it were not.
+    Re-importing a plain MIDI file lets Dorico's own, more mature MIDI-import
+    engine choose voices/stems/beaming itself. Trade-off the user explicitly
+    accepted: no velocity-derived <dynamics> marks (MusicXML-only - raw
+    velocity is still in the file, just not rendered as text) and no
+    explicit lead/secondary voice tagging (merged back into one line per
+    hand; Dorico re-derives voices on its own, same as it would for genuine
+    performance MIDI).
+
+    notation_scale multiplies tick positions/durations directly, ticks_per_beat
+    held fixed - the MIDI-domain equivalent of Bitwig's own Content Scaling
+    (50%/200%) the user originally asked about, and far simpler than the
+    MusicXML route's augmentOrDiminish-after-quantize dance: there is no
+    notated-grid model here for a pre/post scale order to interact badly
+    with, so a plain integer multiply is exact.
+    """
+    out = mido.MidiFile(ticks_per_beat=ticks_per_beat)
+    for staff, channel in (("RH", 0), ("LH", 1)):
+        # (tick, is_note_on, pitch, velocity) - sorting is_note_on False
+        # before True at an equal tick lets a note ending exactly when
+        # another of the same pitch begins produce a clean off-then-on pair
+        # rather than an ambiguous overlap on one MIDI channel.
+        events: list[tuple[int, bool, int, int]] = []
+        for voice_num in (1, 2):
+            for group in grouped.get((staff, voice_num), []):
+                for n in group:
+                    start = round(n.start_tick * notation_scale)
+                    end = round(n.end_tick * notation_scale)
+                    events.append((start, True, n.pitch, n.velocity))
+                    events.append((end, False, n.pitch, 0))
+        if not events:
+            # Nothing landed on this hand at all (Hands=Left/Right run) - an
+            # empty staff is legitimate, not an error; just skip the track.
+            continue
+        events.sort(key=lambda e: (e[0], e[1]))
+        track = mido.MidiTrack()
+        track.name = staff
+        out.tracks.append(track)
+        last_tick = 0
+        for tick, is_on, pitch, velocity in events:
+            delta = tick - last_tick
+            last_tick = tick
+            track.append(mido.Message("note_on" if is_on else "note_off",
+                                       note=pitch, velocity=velocity, time=delta, channel=channel))
+    out.save(output_path)
+
+
 def build_score(grouped: dict[tuple[str, int], list[list[RawNote]]], ticks_per_beat: int,
                 time_sig: str, dynamics_marks: list[tuple[float, str]] = (),
                 notation_scale: float = 1.0) -> stream.Score:
@@ -592,7 +652,13 @@ def build_score(grouped: dict[tuple[str, int], list[list[RawNote]]], ticks_per_b
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("input_mid", help="Captured MIDI file (e.g. from OrchCapture)")
-    ap.add_argument("output_musicxml", help="Output .musicxml path")
+    ap.add_argument("output_path",
+                     help="Output path. A .mid/.midi extension writes a plain 2-track "
+                          "(RH/LH) Standard MIDI File instead of MusicXML - use this when "
+                          "music21's own notation (stems/voices/beaming) looks worse than "
+                          "letting Dorico's MIDI import decide those on its own; the "
+                          "merge/safety-net corrections still apply either way. Any other "
+                          "extension writes MusicXML as before.")
     ap.add_argument("--track", default=None,
                      help="Track index or exact track name to read (default: auto-detect by 'OrchPiano' in the name)")
     ap.add_argument("--channel-base", type=int, default=None,
@@ -625,6 +691,26 @@ def main():
     _guard_hand_playability(raw_notes, args.max_hand_span, args.max_hand_notes)
     _report_hand_crossing(raw_notes, mid.ticks_per_beat)
 
+    grouped = _group_by_line_and_onset(raw_notes)
+    # _fix_voice_stem_order runs BEFORE _guard_staggered_overlaps even on the
+    # MIDI path (which otherwise has no use for stem direction) - it swaps
+    # which onset-groups sit in the voice-1 vs voice-2 bucket, which changes
+    # what _guard_staggered_overlaps considers "the same line" and therefore
+    # what it truncates. write_midi() re-merges both buckets per hand anyway,
+    # so the swap itself is a no-op for the final MIDI notes, but running the
+    # guards in a different order than the MusicXML path would silently
+    # change which overlaps get caught.
+    _fix_voice_stem_order(grouped)
+    _guard_staggered_overlaps(grouped)
+
+    if args.output_path.lower().endswith((".mid", ".midi")):
+        # MIDI path skips build_score()/music21 entirely - the dynamics
+        # marks are a MusicXML-only concern (<dynamics> text; raw velocity
+        # is still in the file either way).
+        write_midi(grouped, mid.ticks_per_beat, args.output_path, notation_scale=args.notation_scale)
+        print(f"Wrote {args.output_path}")
+        return
+
     # min_hold_beats is divided by the scale so "holds for 1 beat" still
     # means one beat of the FINAL, post-scale notation, not one beat of the
     # denser pre-scale grid - the marks themselves are computed at unscaled
@@ -635,14 +721,10 @@ def main():
     if dynamics_marks:
         print(f"Computed {len(dynamics_marks)} dynamics mark(s) from velocity.")
 
-    grouped = _group_by_line_and_onset(raw_notes)
-    _fix_voice_stem_order(grouped)
-    _guard_staggered_overlaps(grouped)
-
     score = build_score(grouped, mid.ticks_per_beat, args.time_signature, dynamics_marks,
                         notation_scale=args.notation_scale)
-    score.write("musicxml", fp=args.output_musicxml)
-    print(f"Wrote {args.output_musicxml}")
+    score.write("musicxml", fp=args.output_path)
+    print(f"Wrote {args.output_path}")
 
 
 if __name__ == "__main__":

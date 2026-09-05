@@ -8,6 +8,11 @@ to keep this a zero-dependency script like the tool itself.
 Run: python test_finisher.py
 """
 
+import os
+import tempfile
+
+import mido
+
 from orchpiano_finisher import (
     RawNote,
     _guard_hand_playability,
@@ -15,6 +20,7 @@ from orchpiano_finisher import (
     _group_by_line_and_onset,
     compute_dynamics_marks,
     build_score,
+    write_midi,
 )
 
 failures = 0
@@ -136,6 +142,57 @@ def test_quantize_does_not_invent_tuplets_from_straight_32nd_notes():
           f"spurious tuplets (got {len(rh_notes)} notes, {len(tupleted)} with a tuplet)")
 
 
+def test_write_midi_merges_voices_and_scales_ticks():
+    # 2026-09-05: added after the user's own direct assessment of real
+    # Dorico output - music21's MusicXML writer produced useless cross-staff
+    # stems, no real up/down-stem voice separation, and almost no logical
+    # beaming for this piano-reduction shape. write_midi() bypasses music21's
+    # notation model entirely and writes a plain 2-track (RH/LH) MIDI file,
+    # trusting Dorico's own more mature MIDI-import engine to choose voices/
+    # stems/beaming - trading away <dynamics> marks and explicit lead/
+    # secondary voice tagging, a trade the user explicitly accepted.
+    #
+    # This test checks two things a silent regression could break: (1) voice
+    # 1 and voice 2 notes on the same hand both land on that hand's single
+    # MIDI channel (the whole point - Dorico re-derives voices on its own),
+    # and (2) notation_scale multiplies tick positions/durations directly
+    # (ticks_per_beat held fixed), the MIDI-domain equivalent of Bitwig's
+    # Content Scaling - simpler than the MusicXML route since there is no
+    # notated-grid model to interact badly with.
+    tpb = 960
+    notes = [
+        RawNote(channel_offset=0, pitch=72, velocity=80, start_tick=0, end_tick=480),   # RH voice 1
+        RawNote(channel_offset=1, pitch=60, velocity=80, start_tick=480, end_tick=960),  # RH voice 2
+        RawNote(channel_offset=3, pitch=48, velocity=80, start_tick=0, end_tick=960),    # LH voice 1
+    ]
+    grouped = _group_by_line_and_onset(notes)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "out.mid")
+        write_midi(grouped, tpb, path, notation_scale=2.0)
+        out = mido.MidiFile(path)
+        by_name = {tr.name: tr for tr in out.tracks}
+
+        def events(track):
+            t = 0
+            result = []
+            for m in track:
+                t += m.time
+                if m.type in ("note_on", "note_off"):
+                    result.append((t, m.type, m.note))
+            return sorted(result)
+
+        rh = events(by_name["RH"])
+        lh = events(by_name["LH"])
+        # Both RH pitches (voice 1 AND voice 2) must appear on the one RH
+        # track, and every tick must be exactly doubled (scale=2.0).
+        rh_ok = rh == [(0, "note_on", 72), (960, "note_off", 72),
+                        (960, "note_on", 60), (1920, "note_off", 60)]
+        lh_ok = lh == [(0, "note_on", 48), (1920, "note_off", 48)]
+        check(out.ticks_per_beat == tpb and rh_ok and lh_ok,
+              f"write_midi: voices merge per hand and ticks scale exactly (got RH={rh}, LH={lh})")
+
+
 def test_notation_scale_doubles_offsets_and_durations():
     # 2026-09-05: --notation-scale replicates the manual Dorico "Requantize
     # then double durations" dance via music21's augmentOrDiminish(), applied
@@ -176,6 +233,7 @@ if __name__ == "__main__":
     test_voice_stem_swap_resolves_single_vs_single()
     test_dynamics_hysteresis_ignores_brief_blip()
     test_quantize_does_not_invent_tuplets_from_straight_32nd_notes()
+    test_write_midi_merges_voices_and_scales_ticks()
     test_notation_scale_doubles_offsets_and_durations()
 
     if failures == 0:
