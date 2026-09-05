@@ -88,6 +88,54 @@ def test_dynamics_hysteresis_ignores_brief_blip():
           f"dynamics hysteresis: brief blip ignored, genuine change marked (got {marks})")
 
 
+def test_quantize_does_not_invent_tuplets_from_straight_32nd_notes():
+    # 2026-09-05: found on a real MC piece ("slack_tide") - build_score()'s
+    # p.quantize(inPlace=True, recurse=True) call used music21's own default
+    # quarterLengthDivisors, (4, 3) (16th notes or 8th-note triplets). MPL is
+    # explicitly restricted to plain power-of-2 rhythms (no "crazy rhythm
+    # formations"), but OrchPiano's own capture can genuinely need 32nd-note
+    # resolution (quarterLength 0.125) - a value NEITHER divisor reaches. Left
+    # to guess note-by-note which of the two ill-fitting grids was numerically
+    # closer, quantize() misread long straight 32nd-note runs as scattered
+    # eighth-note triplets - confirmed directly against real Finisher output
+    # (113 real <tuplet> elements in a piece with none in the source MIDI).
+    # Fixed by passing quarterLengthDivisors=(8, 6) explicitly - 32nd notes or
+    # 16th-note triplets, the exact floor the user has always set by hand in
+    # Dorico's own Requantize dialog for MPL-driven takes. This test builds a
+    # plain 32nd-note-grid RH line through the real build_score() and asserts
+    # NONE of its notes carry a tuplet - the class of defect a future
+    # accidental revert to bare quantize() would reintroduce silently.
+    # Real (pitch, start_tick, end_tick) triples lifted directly from
+    # OrchPiano_slack_tide.mid's channel 0 (RH lead), ticks 0-13080, tpb=960 -
+    # NOT synthesized. A first attempt at this test used 16 hand-built,
+    # perfectly uniform 32nd notes and it passed under BOTH the buggy default
+    # divisors and the fix - quantize()'s look-ahead handles a uniform run
+    # fine, so that fixture didn't actually exercise the bug. Confirmed this
+    # real excerpt does discriminate before trusting it: re-running it through
+    # the pre-fix bare `p.quantize(inPlace=True, recurse=True)` produces 7
+    # spurious tupleted notes; the fix (quarterLengthDivisors=(8, 6)) produces
+    # zero. Real, mixed-duration/mixed-onset performance data is what exposed
+    # the per-note ping-ponging; synthetic uniform data was not enough.
+    real_excerpt = [
+        (72, 0, 1080), (76, 0, 1080), (70, 1080, 1440), (68, 2040, 2400),
+        (67, 2880, 3360), (68, 2880, 3360), (64, 3360, 3960),
+        (75, 3960, 5280), (76, 3960, 5280), (61, 5280, 5760),
+        (64, 5760, 6360), (66, 6360, 6720), (61, 6720, 7800),
+        (67, 7800, 8640), (78, 7800, 8760), (62, 8760, 9240),
+        (69, 9240, 9720), (67, 9720, 10200), (68, 10200, 10560),
+        (63, 11520, 13080),
+    ]
+    notes = [RawNote(channel_offset=0, pitch=p, velocity=80, start_tick=s, end_tick=e)
+             for p, s, e in real_excerpt]
+    grouped = _group_by_line_and_onset(notes)
+    score = build_score(grouped, 960, "4/4")
+    rh_notes = list(score.parts[0].flatten().notes)
+    tupleted = [n for n in rh_notes if n.duration.tuplets]
+    check(not tupleted,
+          f"quantize: a real MPL-restricted (no true triplets) excerpt produces no "
+          f"spurious tuplets (got {len(rh_notes)} notes, {len(tupleted)} with a tuplet)")
+
+
 def test_notation_scale_doubles_offsets_and_durations():
     # 2026-09-05: --notation-scale replicates the manual Dorico "Requantize
     # then double durations" dance via music21's augmentOrDiminish(), applied
@@ -127,6 +175,7 @@ if __name__ == "__main__":
     test_hand_playability_new_note_owns_extreme()
     test_voice_stem_swap_resolves_single_vs_single()
     test_dynamics_hysteresis_ignores_brief_blip()
+    test_quantize_does_not_invent_tuplets_from_straight_32nd_notes()
     test_notation_scale_doubles_offsets_and_durations()
 
     if failures == 0:

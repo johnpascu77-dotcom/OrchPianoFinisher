@@ -524,10 +524,33 @@ def build_score(grouped: dict[tuple[str, int], list[list[RawNote]]], ticks_per_b
             continue
         # Real captured performance timing isn't grid-aligned; MusicXML can
         # only express notated (non-arbitrary-fraction) durations, so snap to
-        # the nearest 16th note or 8th-note triplet before notating. This is
-        # a display-quantization step, not a musical decision OrchPiano
-        # already made - it does not touch pitch, hand, or voice assignment.
-        p.quantize(inPlace=True, recurse=True)
+        # a grid before notating. This is a display-quantization step, not a
+        # musical decision OrchPiano already made - it does not touch pitch,
+        # hand, or voice assignment.
+        #
+        # 2026-09-05: MUST pass quarterLengthDivisors=(8, 6) explicitly - do
+        # NOT rely on quantize()'s own default, (4, 3) (16th notes or 8th-
+        # note triplets). Found on "slack_tide": MPL's captured onsets
+        # genuinely land on a 32nd-note grid (confirmed directly in the raw
+        # MIDI with mido - 247 of 784 note-ons sit at exactly a 120-tick/960
+        # offset, i.e. quarterLength 0.125, the exact 32nd-note position, NOT
+        # a triplet - MPL is explicitly restricted to plain power-of-2
+        # rhythms, no "crazy rhythm formations"). (4, 3) has no divisor that
+        # reaches 0.125 at all, so quantize() was forced to snap each such
+        # note independently to whichever of the 16th grid or the 8th-note-
+        # triplet grid happened to be numerically closer - misreading a
+        # perfectly plain run of 32nd notes as scattered eighth-note
+        # triplets, one note at a time. This produced real, valid-but-absurd
+        # tuplet notation (confirmed directly in the exported MusicXML) that
+        # a later --notation-scale 2 pass then compounded into even more
+        # unusual quarter-note-level triplets - but the doubling only ever
+        # exposed a pre-existing quantize() bug, it did not cause it (the
+        # SAME spurious triplets, just at the 8th-note level, are already
+        # present with notation_scale=1.0). (8, 6) - 32nd notes or 16th-note
+        # triplets - is exactly the manual floor the user has always had to
+        # set by hand in Dorico's own Requantize dialog for MPL-driven
+        # takes; matching it here removes the ambiguity that caused this.
+        p.quantize(quarterLengthDivisors=(8, 6), inPlace=True, recurse=True)
         if notation_scale != 1.0:
             # AFTER quantize, never before: quantize()'s grid-choice has
             # adaptive look-ahead across neighboring notes that does not
