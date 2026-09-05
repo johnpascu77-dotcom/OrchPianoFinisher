@@ -305,6 +305,48 @@ def _group_by_line_and_onset(notes: list[RawNote]) -> dict[tuple[str, int], list
     return grouped
 
 
+def _fix_voice_stem_order(grouped: dict[tuple[str, int], list[list[RawNote]]]) -> None:
+    """Notation-only fix - does NOT touch pitch, duration, or hand
+    assignment, only which onset-group is labeled notational voice 1
+    (up-stem, by convention) vs voice 2 (down-stem). OrchPiano's own
+    streamHandVoices() picks the secondary voice by CONTINUITY (closest to
+    the line's last pitch, or longest-held), never by register - so voice 1
+    (everything it didn't peel off) very often ends up sounding LOWER than
+    voice 2 at a given attack, which every notation program still renders
+    up-stem/down-stem by voice number regardless of actual pitch. The result
+    is exactly the visual mess of up-stem notes sitting below down-stem ones
+    that prompted this fix.
+
+    Only swaps attacks that share an EXACT onset tick between voice 1 and
+    voice 2 on the same hand - the case that clashes most visibly - and only
+    when doing so puts the higher-AVERAGE-pitch attack on top. This is a
+    heuristic, not a full crossing-eliminator: a wide chord in one voice
+    against a single note in the other can still cross after the swap (the
+    chord's own notes span a range no single swap can fully resolve without
+    re-splitting which pitches belong to which voice, which would be
+    re-deciding OrchPiano's own content - out of scope here). Mutates
+    `grouped` in place."""
+    swapped = 0
+    for staff in ("RH", "LH"):
+        key1, key2 = (staff, 1), (staff, 2)
+        if key1 not in grouped or key2 not in grouped:
+            continue
+        groups1, groups2 = grouped[key1], grouped[key2]
+        by_tick1 = {g[0].start_tick: i for i, g in enumerate(groups1)}
+        by_tick2 = {g[0].start_tick: i for i, g in enumerate(groups2)}
+        for tick in sorted(set(by_tick1) & set(by_tick2)):
+            i1, i2 = by_tick1[tick], by_tick2[tick]
+            g1, g2 = groups1[i1], groups2[i2]
+            avg1 = sum(n.pitch for n in g1) / len(g1)
+            avg2 = sum(n.pitch for n in g2) / len(g2)
+            if avg2 > avg1:
+                groups1[i1], groups2[i2] = g2, g1
+                swapped += 1
+    if swapped:
+        print(f"NOTE: swapped stem-direction voice assignment for {swapped} same-instant attack(s) "
+              "(the down-stem voice would otherwise have sounded higher).", file=sys.stderr)
+
+
 def _guard_staggered_overlaps(grouped: dict[tuple[str, int], list[list[RawNote]]]) -> None:
     """Narrow hygiene guard, NOT the Phase-2 cross-hand/cross-onset safety
     net: between two DIFFERENT attacks on the same line (never within one
@@ -437,6 +479,7 @@ def main():
     _report_hand_crossing(raw_notes, mid.ticks_per_beat)
 
     grouped = _group_by_line_and_onset(raw_notes)
+    _fix_voice_stem_order(grouped)
     _guard_staggered_overlaps(grouped)
 
     score = build_score(grouped, mid.ticks_per_beat, args.time_signature)
