@@ -13,11 +13,14 @@ import tempfile
 
 import mido
 
+from music21 import expressions
+
 from orchpiano_finisher import (
     RawNote,
     _guard_hand_playability,
     _fix_voice_stem_order,
     _group_by_line_and_onset,
+    _collapse_octave_tremolos,
     compute_dynamics_marks,
     build_score,
     write_midi,
@@ -260,6 +263,79 @@ def test_notation_scale_doubles_offsets_and_durations():
           f"scaled={scaled_pairs}, expected={doubled_expected})")
 
 
+def test_collapse_octave_tremolo_run_becomes_two_notes():
+    # A real shape (2026-09-06): OrchPiano's Phase 5c-2d octave-tremolo plays
+    # A2 (57) alternating with A3 (69) every 16th note (240 ticks @ tpb=960)
+    # on the LH lead line - 8 hits = 4 full cycles, well past the 4-hit floor.
+    tpb = 960
+    step = tpb // 4
+    notes = []
+    for i in range(8):
+        pitch = 57 if i % 2 == 0 else 69
+        notes.append(RawNote(channel_offset=3, pitch=pitch, velocity=100,
+                             start_tick=i * step, end_tick=(i + 1) * step))
+    grouped = _group_by_line_and_onset(notes)
+    collapsed = _collapse_octave_tremolos(grouped, tpb)
+
+    line = grouped[("LH", 1)]
+    pitches = [g[0].pitch for g in line]
+    check(collapsed == 1 and pitches == [57, 69],
+          f"collapse_octave_tremolos: 8-hit run -> exactly 2 notes, low then high (got {pitches})")
+    check(line[0][0].end_tick == line[1][0].start_tick == 4 * step,
+          "collapse_octave_tremolos: the two notes meet exactly at the run's midpoint")
+    check(line[0][0].tremolo_pair_id is not None
+          and line[0][0].tremolo_pair_id == line[1][0].tremolo_pair_id,
+          "collapse_octave_tremolos: both replacement notes share one tremolo_pair_id")
+
+
+def test_collapse_octave_tremolo_ignores_short_or_non_octave_runs():
+    tpb = 960
+    step = tpb // 4
+    # Only 2 hits - below the 4-hit floor, a real repeated note shouldn't be
+    # mistaken for a genuine roll from this little evidence.
+    short_run = [
+        RawNote(channel_offset=3, pitch=57, velocity=100, start_tick=0, end_tick=step),
+        RawNote(channel_offset=3, pitch=69, velocity=100, start_tick=step, end_tick=2 * step),
+    ]
+    grouped = _group_by_line_and_onset(short_run)
+    collapsed = _collapse_octave_tremolos(grouped, tpb)
+    check(collapsed == 0 and len(grouped[("LH", 1)]) == 2,
+          "collapse_octave_tremolos: a 2-hit run is left alone (below the floor)")
+
+    # A climbing run (57,69,81,...) differs by 12 at every step but never
+    # actually alternates back - must NOT be swept into a tremolo collapse.
+    climb = [
+        RawNote(channel_offset=3, pitch=57 + 12 * i, velocity=100,
+               start_tick=i * step, end_tick=(i + 1) * step)
+        for i in range(5)
+    ]
+    grouped2 = _group_by_line_and_onset(climb)
+    collapsed2 = _collapse_octave_tremolos(grouped2, tpb)
+    check(collapsed2 == 0 and len(grouped2[("LH", 1)]) == 5,
+          "collapse_octave_tremolos: a continuously climbing run is NOT a tremolo, left alone")
+
+
+def test_collapse_octave_tremolo_gets_a_tremolo_spanner_in_the_score():
+    tpb = 960
+    step = tpb // 4
+    notes = []
+    for i in range(8):
+        pitch = 57 if i % 2 == 0 else 69
+        notes.append(RawNote(channel_offset=3, pitch=pitch, velocity=100,
+                             start_tick=i * step, end_tick=(i + 1) * step))
+    grouped = _group_by_line_and_onset(notes)
+    _collapse_octave_tremolos(grouped, tpb)
+    score = build_score(grouped, tpb, "4/4")
+
+    spanners = list(score.recurse().getElementsByClass(expressions.TremoloSpanner))
+    check(len(spanners) == 1, f"tremolo spanner: exactly one TremoloSpanner in the score (got {len(spanners)})")
+    if spanners:
+        spanned_pitches = sorted(n.pitch.midi for n in spanners[0].getSpannedElements())
+        check(spanned_pitches == [57, 69],
+              f"tremolo spanner: joins the low (57) and high (69) notes (got {spanned_pitches})")
+        check(spanners[0].numberOfMarks == 2, "tremolo spanner: 2 marks (16th-note tremolo)")
+
+
 if __name__ == "__main__":
     test_hand_playability_new_note_owns_extreme()
     test_hand_playability_same_onset_victim_is_dropped_not_zeroed()
@@ -268,6 +344,9 @@ if __name__ == "__main__":
     test_quantize_does_not_invent_tuplets_from_straight_32nd_notes()
     test_write_midi_merges_voices_and_scales_ticks()
     test_notation_scale_doubles_offsets_and_durations()
+    test_collapse_octave_tremolo_run_becomes_two_notes()
+    test_collapse_octave_tremolo_ignores_short_or_non_octave_runs()
+    test_collapse_octave_tremolo_gets_a_tremolo_spanner_in_the_score()
 
     if failures == 0:
         print("\nAll tests passed.")

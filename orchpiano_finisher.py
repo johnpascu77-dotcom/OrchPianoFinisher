@@ -72,7 +72,7 @@ import sys
 from dataclasses import dataclass
 
 import mido
-from music21 import chord, clef, dynamics, instrument, layout, meter, note, stream
+from music21 import chord, clef, dynamics, expressions, instrument, layout, meter, note, stream
 
 # Roughly equal 1-127 splits into the 6 dynamics the design doc settled on
 # (SS3) - not a claim that real dynamics are evenly spaced, just a simple,
@@ -96,6 +96,10 @@ class RawNote:
     velocity: int
     start_tick: int
     end_tick: int
+    # Set only by _collapse_octave_tremolos: shared between the exactly-2
+    # replacement notes of one collapsed octave-tremolo run, so build_score
+    # can find the matching pair and join them with a TremoloSpanner.
+    tremolo_pair_id: int | None = None
 
 
 def _has_note_events(tr) -> bool:
@@ -495,6 +499,84 @@ def _guard_staggered_overlaps(grouped: dict[tuple[str, int], list[list[RawNote]]
               "(distinct from same-onset chords, which are never touched here).", file=sys.stderr)
 
 
+def _collapse_octave_tremolos(grouped: dict[tuple[str, int], list[list[RawNote]]],
+                              ticks_per_beat: int) -> int:
+    """OrchPiano's own 'RepeatedNote -> octave tremolo' feature (Phase 5c-2d,
+    2026-09-06) plays a real, audible run of alternating same-pitch-class
+    notes a fixed 16th note apart - correct for playback, but notating each
+    strike literally beams out as a long run of individual noteheads
+    (confirmed against a real Dorico render - the user's own screenshot
+    showed exactly this, contrasted against a published reduction's
+    measured-tremolo shorthand). This is a NOTATION-only transform: detect
+    such a run and replace it with exactly two notes (the low and high
+    pitch, each holding half the run's total span) joined by a music21
+    TremoloSpanner - the conventional two-note measured-tremolo engraving.
+    MIDI export is unaffected (see main() - this only ever runs on the
+    MusicXML path, where the real alternating audio timing isn't needed,
+    only its notated shorthand). Mutates `grouped` in place. Returns the
+    number of runs collapsed."""
+    step_ticks = max(1, ticks_per_beat // 4)   # the 16th-note rate OrchPiano emits at
+    tolerance = max(2, step_ticks // 6)        # real timing isn't perfectly exact
+    min_run = 4                                # at least 2 full low/high cycles
+    collapsed = 0
+    next_pair_id = 0
+
+    for groups in grouped.values():
+        new_groups: list[list[RawNote]] = []
+        i = 0
+        while i < len(groups):
+            g = groups[i]
+            if len(g) != 1:
+                new_groups.append(g)
+                i += 1
+                continue
+
+            run = [g]
+            low_ref = g[0].pitch
+            high_ref = None
+            j = i + 1
+            while j < len(groups) and len(groups[j]) == 1:
+                prev, cur = run[-1][0], groups[j][0]
+                if abs((cur.start_tick - prev.start_tick) - step_ticks) > tolerance:
+                    break
+                if high_ref is None:
+                    if cur.pitch - prev.pitch != 12:
+                        break
+                    high_ref = cur.pitch
+                elif cur.pitch != (low_ref if prev.pitch == high_ref else high_ref):
+                    break
+                run.append(groups[j])
+                j += 1
+
+            if len(run) >= min_run:
+                start_tick = run[0][0].start_tick
+                end_tick = max(n.end_tick for grp in run for n in grp)
+                half = max(1, (end_tick - start_tick) // 2)
+                velocity = max(n.velocity for grp in run for n in grp)
+                chan = g[0].channel_offset
+
+                low_note = RawNote(chan, low_ref, velocity, start_tick, start_tick + half,
+                                   tremolo_pair_id=next_pair_id)
+                high_note = RawNote(chan, high_ref, velocity, start_tick + half, end_tick,
+                                    tremolo_pair_id=next_pair_id)
+                next_pair_id += 1
+                collapsed += 1
+
+                new_groups.append([low_note])
+                new_groups.append([high_note])
+                i = j
+            else:
+                new_groups.append(g)
+                i += 1
+        groups[:] = new_groups
+
+    if collapsed:
+        print(f"NOTE: collapsed {collapsed} octave-tremolo run(s) into measured-tremolo "
+              "notation (two notes + tremolo beam) - MIDI playback timing is unaffected, "
+              "this only changes MusicXML notation.", file=sys.stderr)
+    return collapsed
+
+
 def _guard_cross_voice_pitch_overlaps(notes: list[RawNote]) -> int:
     """Truncate any same-pitch overlap regardless of which voice it came
     from. _guard_staggered_overlaps only ever checks within one (staff,
@@ -620,6 +702,10 @@ def build_score(grouped: dict[tuple[str, int], list[list[RawNote]]], ticks_per_b
         p.insert(0, meter.TimeSignature(time_sig))
 
     voices: dict[tuple[str, int], stream.Voice] = {}
+    # _collapse_octave_tremolos (see main()) marks its two replacement notes
+    # with a shared tremolo_pair_id - collect the first one seen per id here,
+    # then join it to the second with a TremoloSpanner once both exist.
+    pending_tremolo_starts: dict[int, tuple[note.Note, stream.Voice]] = {}
 
     for key, groups in grouped.items():
         staff, voice_num = key
@@ -641,6 +727,23 @@ def build_score(grouped: dict[tuple[str, int], list[list[RawNote]]], ticks_per_b
                 nn.volume.velocity = max(n.velocity for n in group)
             nn.quarterLength = duration_ql
             voices[key].insert(offset_ql, nn)
+
+            pair_id = group[0].tremolo_pair_id
+            if pair_id is not None:
+                if pair_id not in pending_tremolo_starts:
+                    pending_tremolo_starts[pair_id] = (nn, voices[key])
+                else:
+                    start_note, start_voice = pending_tremolo_starts.pop(pair_id)
+                    ts = expressions.TremoloSpanner()
+                    ts.addSpannedElements([start_note, nn])
+                    ts.numberOfMarks = 2   # 16th-note tremolo (see _collapse_octave_tremolos)
+                    # Spanners live in the stream, referencing elements that
+                    # can sit in a DIFFERENT voice than where the spanner
+                    # itself is inserted - insert into whichever of the two
+                    # voices is this (the later) note's own, matching how
+                    # music21's own examples anchor a spanner near its
+                    # elements rather than at the score root.
+                    start_voice.insert(0, ts)
 
     for (staff, voice_num), v in sorted(voices.items(), key=lambda kv: (kv[0][0], kv[0][1])):
         parts[staff].insert(0, v)
@@ -782,10 +885,19 @@ def main():
     if args.output_path.lower().endswith((".mid", ".midi")):
         # MIDI path skips build_score()/music21 entirely - the dynamics
         # marks are a MusicXML-only concern (<dynamics> text; raw velocity
-        # is still in the file either way).
+        # is still in the file either way). It also skips the octave-tremolo
+        # notation collapse below - real audio playback needs the actual
+        # alternating notes, not their two-note notated shorthand.
         write_midi(grouped, mid.ticks_per_beat, args.output_path, notation_scale=args.notation_scale)
         print(f"Wrote {args.output_path}")
         return
+
+    # MusicXML path only, and only from here on: OrchPiano's octave-tremolo
+    # feature (Phase 5c-2d) plays a real alternating run for correct audio,
+    # but notating each strike literally beams out as many individual
+    # noteheads rather than the conventional two-note tremolo shorthand -
+    # collapse it before building the score.
+    _collapse_octave_tremolos(grouped, mid.ticks_per_beat)
 
     # min_hold_beats is divided by the scale so "holds for 1 beat" still
     # means one beat of the FINAL, post-scale notation, not one beat of the

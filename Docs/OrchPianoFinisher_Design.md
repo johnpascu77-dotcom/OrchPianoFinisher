@@ -685,3 +685,47 @@ from the list, not left at zero/negative duration. Re-ran against the real captu
 `slack_tide_finished.mid` has zero same-pitch overlaps and perfectly balanced 469/469 (RH)
 and 271/271 (LH) note-on/off pairs - the number Dorico's own import should now match
 exactly.
+
+## 18. `_collapse_octave_tremolos` — a real orchestral-roll run needs measured-tremolo notation, not literal noteheads
+
+2026-09-06. Companion fix to OrchPiano's own Phase 5c-2d (see the OrchPiano repo's design
+doc): a detected `RepeatedNote` figure (the raw MIDI shape of an orchestral roll - timpani,
+tremolo strings) now plays back as a real, audible alternation between a pitch and its
+octave partner, at a fixed 16th-note rate - correct for playback, confirmed against a
+published Grieg reduction as the right underlying idea. But the user's own Dorico
+screenshot of the actual result showed the problem this section fixes: importing that
+alternation as literal MIDI notes beams out as a long run of individual noteheads (visually
+nothing like the reference screenshot's abbreviated two-note tremolo-slash convention the
+user pointed to directly). Exact words: "the intention for the tremolo is there, but it
+should be a transformative operation, from repeated notes to alternating between the low
+and high octaves... in 16th values" - i.e. OrchPiano's job (play the correct alternation)
+was right; the missing piece was **this tool's job**: recognize that alternation in the
+captured MIDI and re-notate it using the actual notation-software convention for a measured
+tremolo, which has no MIDI equivalent at all (MIDI only has notes, never a "these two are a
+tremolo" marking) - only a notation-aware tool downstream of raw MIDI can ever produce it.
+
+**Design**: `_collapse_octave_tremolos(grouped, ticks_per_beat)` scans each (staff, voice)
+line for a run of single-note onset-groups that (a) sit at a consistent ~16th-note interval
+(`ticks_per_beat // 4`, ±small tolerance for real timing) and (b) strictly alternate
+between exactly two pitches locked in from the run's first step (rejects a continuously
+climbing sequence that happens to also differ by 12 at every step - not a real tremolo).
+Requires >= 4 hits (2 full cycles) before collapsing, so an incidental short repeated note
+isn't mistaken for a genuine roll. A matching run is replaced with exactly two notes - the
+low and high pitch, each holding half the run's total span - tagged with a shared
+`tremolo_pair_id`. `build_score` picks up that tag when building each music21 `Note` and
+joins the pair with a `music21.expressions.TremoloSpanner` (`numberOfMarks=2`, matching the
+16th-note rate), which music21's MusicXML writer serializes as the real
+`<tremolo type="start/stop">2</tremolo>` ornament - verified directly in generated XML, not
+just at the music21-object level, since a class match doesn't guarantee correct
+serialization. Runs only on the MusicXML path (`main()`) - `write_midi`'s plain-MIDI output
+is deliberately left untouched, since actual audio playback still needs the real alternating
+notes, not their two-note notated shorthand.
+
+**Verified**: three new tests in `test_finisher.py` using the real touched-pitch shape (A2/A3,
+tpb=960, 8 hits) - correct collapse to exactly 2 notes meeting at the run's midpoint sharing
+one `tremolo_pair_id`; a 2-hit run and a continuously-climbing 5-note run are both correctly
+left alone; and an end-to-end `build_score` check confirming exactly one `TremoloSpanner`
+lands in the resulting score, joining the right two pitches, with `numberOfMarks == 2`. Full
+suite (15/15) green. Not yet tested against a real capture containing an actual OrchPiano
+octave-tremolo run - the existing Grieg captures all predate that OrchPiano feature; needs a
+fresh Bitwig replay with the new OrchPiano build before an end-to-end real-data check.
