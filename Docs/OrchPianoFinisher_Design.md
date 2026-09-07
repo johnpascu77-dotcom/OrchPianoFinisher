@@ -729,3 +729,73 @@ lands in the resulting score, joining the right two pitches, with `numberOfMarks
 suite (15/15) green. Not yet tested against a real capture containing an actual OrchPiano
 octave-tremolo run - the existing Grieg captures all predate that OrchPiano feature; needs a
 fresh Bitwig replay with the new OrchPiano build before an end-to-end real-data check.
+
+## 19. Time-signature auto-detection, and the real reason the MusicXML output was "completely unusable" in Dorico
+
+2026-09-07. Two items raised together after a fresh Bitwig take
+(`OrchCapture_Grand Piano_1788782693265.mid`, 6/8, testing OrchPiano's `kdeHandSplit`
+rewrite + per-hand role-tagging fix from the day before - see the OrchPiano repo's own
+design doc §Phase 3/5a for that trace).
+
+**Time signature**: `extract_time_signatures(mid)` scans *every* track (not just the
+OrchPiano/data track found by `find_orchpiano_track`) for `time_signature` meta messages
+and returns tick-sorted `(tick, "num/den")` pairs. Necessary because OrchCapture writes
+these into its own separate meta track (alongside track-name/tempo/markers), which can
+share the exact same track *name* as the note-data track - confirmed on this real capture,
+both tracks are named "Grand Piano". `--time-signature` now defaults to `None` (auto-detect,
+falls back to 4/4 with a warning if the capture has none); passing it explicitly still
+overrides. `build_score()`'s signature changed from a single `time_sig: str` to
+`time_sigs: list[tuple[int, str]]`, inserted at each entry's own quarterLength offset, so a
+genuine meter change mid-piece notates correctly rather than only ever reading the first bar.
+Confirmed live: this capture's own embedded meter (6/8, matching Grieg's real "Morning Mood"
+meter) was read back correctly with zero flags needed.
+
+**The MusicXML/Dorico problem - actually two separate, real bugs, not the PartStaff
+approach itself**. The user's report ("completely unusable... instead of having the RH and
+LH staves... taken as independent staves") pointed straight at `build_score()`'s two
+`PartStaff` + braced `StaffGroup` approach as the suspect - reasonable, since that's the
+visible structure in this file. Checked against real output instead of assuming: music21's
+own exporter (`PartStaffExporterMixin.joinPartStaffs()`, called automatically from
+`ScoreExporter.parse()`/`Score.write()`) *already* merges two grouped PartStaffs into a
+single MusicXML `<part>`/`<score-part>` with `<staves>2</staves>` and per-note `<staff>`
+tags - confirmed directly in this take's generated XML (`<part id=...>` count: 1;
+`<staves>` count: 1). So the PartStaff design itself was never the defect - two real, separate
+bugs downstream of it were:
+
+1. **Missing `<part-symbol>`**: music21's own exporter source has a literal
+   `# TODO: part-symbol` left unimplemented right where `<staves>` gets written
+   (`m21ToXml.py`, `setMxAttributesObjectForStartOfMeasure`) - it never emits the element
+   that formally declares the two staves braced into one grand-staff keyboard instrument.
+   Without it, an importer sees two correctly-numbered staves in one part but no explicit
+   "these are one braced piano" signal - very plausibly why Dorico's import didn't read it
+   as a single native piano instrument. No music21-level hook exists to set this during
+   export, so `_add_part_symbol_brace(xml_path)` post-processes the written file directly:
+   inserts `<part-symbol>brace</part-symbol>` right after the first `<staves>` tag (the
+   schema-correct position - `divisions, key, time, staves, part-symbol, instruments,
+   clef...`). No-op when there's only one staff (a Hands=Left/Right-only run) or a
+   `<part-symbol>` is already present (should music21 ever implement that TODO itself).
+2. **Voice-ID collision, found while investigating**: `p.makeMeasures(inPlace=True)` does
+   NOT preserve the `Voice.id` set when building `voices[key]` (`id=str(voice_num)`, "1" or
+   "2") - confirmed directly: a Voice built with `id="1"` comes out of `makeMeasures()` with
+   `id=0` (an int), freshly assigned per-part starting from 0 every time. Since RH and LH are
+   each their own `PartStaff` processed independently, both hands' lead voice silently landed
+   on `id=0` in every measure (and both hands' secondary voice on `id=1`) - real, verified
+   duplicate `<voice>0</voice>` tags on both staff 1 and staff 2 once `joinPartStaffs()`
+   merged them into one part, where MusicXML voice numbers must be unique across the whole
+   part. music21's own `renumberVoicesWithinStaffGroups()` does not catch this - it only
+   renumbers ids it can identify as auto-generated memory-location artifacts (very large
+   ints), and treats any already-small integer id, even an accidental duplicate, as
+   deliberate. Fixed directly after `makeMeasures`/`makeTies`, per part: enumerate each
+   measure's voices in insertion order (lead before secondary, matching how they were
+   inserted into `p`) and assign RH `1`/`2`, LH `3`/`4`.
+
+Both confirmed by inspecting the real generated XML for this take: exactly one `<part>`,
+`<staves>2</staves>`, `<part-symbol>brace</part-symbol>` present, and voice numbers `1`-`4`
+used with zero collisions (previously: no `<part-symbol>` at all, and every note on both
+staves alternating only between `<voice>0</voice>`/`<voice>1</voice>`).
+
+**Same take also confirmed the two pending OrchPiano fixes from the day before**: the
+opening E-major-chord passage (channel 3 = LH lead) now plays as `{E, B, E}` (root, 5th,
+octave - the 3rd correctly omitted, matching the MuseScore reference's own convention) in
+one hand, not split across two hands or collapsed to a bare octave. Both `kdeHandSplit`'s
+gap-based rewrite and the per-hand role re-tagging fix are live-confirmed.

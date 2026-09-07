@@ -68,6 +68,7 @@ the secondary voice) are notated as real chords, never mistaken for overlaps.
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from dataclasses import dataclass
 
@@ -141,6 +142,27 @@ def find_orchpiano_track(mid: mido.MidiFile, track_arg: str | None):
     if not candidates:
         raise SystemExit("No track named 'OrchPiano' found - pass --track <index or exact name>")
     return _pick_among(candidates, "'OrchPiano'-named")
+
+
+def extract_time_signatures(mid: mido.MidiFile) -> list[tuple[int, str]]:
+    """Scan every track (not just the OrchPiano content track) for
+    `time_signature` meta events and return (abs_tick, "num/den") pairs in
+    tick order. OrchCapture (2026-09-06 fix) writes these into its own
+    separate meta track - alongside track-name/tempo/markers - which can
+    share the exact same track NAME as the note-data track ("Grand Piano" in
+    a real capture, not distinguishable by name), so this deliberately does
+    not go through find_orchpiano_track(); it just looks at the whole file.
+    An empty capture (host never reported a meter, or an older OrchCapture
+    build predating the fix) returns []."""
+    found: list[tuple[int, str]] = []
+    for track in mid.tracks:
+        abs_tick = 0
+        for msg in track:
+            abs_tick += msg.time
+            if msg.type == "time_signature":
+                found.append((abs_tick, f"{msg.numerator}/{msg.denominator}"))
+    found.sort(key=lambda pair: pair[0])
+    return found
 
 
 def extract_notes(track, channel_base: int | None) -> tuple[list[RawNote], int]:
@@ -681,13 +703,24 @@ def write_midi(grouped: dict[tuple[str, int], list[list[RawNote]]], ticks_per_be
 
 
 def build_score(grouped: dict[tuple[str, int], list[list[RawNote]]], ticks_per_beat: int,
-                time_sig: str, dynamics_marks: list[tuple[float, str]] = (),
+                time_sigs: list[tuple[int, str]], dynamics_marks: list[tuple[float, str]] = (),
                 notation_scale: float = 1.0) -> stream.Score:
+    """`time_sigs` is a list of (start_tick, "num/den") pairs, tick-sorted,
+    at least one entry (see main() - falls back to a single (0, "4/4") when
+    the capture has no time-signature meta event and the user didn't pass
+    --time-signature). Each is inserted into both staves at its own
+    quarterLength offset so a real meter change notates correctly, not just
+    a single signature at the start."""
     score = stream.Score()
 
-    # PartStaff (not plain Part) + a braced StaffGroup with barTogether=True is
-    # what actually notates as one grand staff on import, rather than two
-    # separate single-staff instruments - the whole point of this tool.
+    # PartStaff (not plain Part) + a braced StaffGroup with barTogether=True
+    # makes music21's own exporter join them into a single MusicXML <part>
+    # with <staves>2</staves> (confirmed by inspecting real output -
+    # PartStaffExporterMixin.joinPartStaffs(), called automatically from
+    # ScoreExporter.parse()) - NOT two separate <part> elements. That part
+    # of "notate as one piano" already worked. What was actually still
+    # missing (see _add_part_symbol_brace below) is a music21 gap, not a
+    # design flaw here.
     parts = {
         "RH": stream.PartStaff(id="RH"),
         "LH": stream.PartStaff(id="LH"),
@@ -699,7 +732,8 @@ def build_score(grouped: dict[tuple[str, int], list[list[RawNote]]], ticks_per_b
     parts["RH"].insert(0, clef.TrebleClef())
     parts["LH"].insert(0, clef.BassClef())
     for p in parts.values():
-        p.insert(0, meter.TimeSignature(time_sig))
+        for tick, sig in time_sigs:
+            p.insert(tick / ticks_per_beat, meter.TimeSignature(sig))
 
     voices: dict[tuple[str, int], stream.Voice] = {}
     # _collapse_octave_tremolos (see main()) marks its two replacement notes
@@ -815,6 +849,30 @@ def build_score(grouped: dict[tuple[str, int], list[list[RawNote]]], ticks_per_b
         # trusting a clean run. makeTies splits it into proper tied
         # fragments, one per measure, that MusicXML can actually represent.
         p.makeTies(inPlace=True)
+        # 2026-09-07: makeMeasures() (just above) does NOT preserve the
+        # Voice.id we set when creating voices[key] - confirmed by direct
+        # inspection (a Voice explicitly built with id="1" comes out the
+        # other side of makeMeasures with id=0, an int, one fresh small
+        # index per measure starting from 0 again for EVERY part). Since RH
+        # and LH are each their own PartStaff processed independently right
+        # here, both hands' lead voice silently ends up id=0 in every
+        # measure, and both hands' secondary voice (if present) ends up
+        # id=1 - real, verified collisions once joinPartStaffs() (see
+        # build_score's own comment above) merges RH+LH into one <part>,
+        # where MusicXML voice numbers must be unique across the WHOLE part,
+        # not just within one original staff. music21's own
+        # renumberVoicesWithinStaffGroups() does not catch this: it only
+        # renumbers ids it can tell are auto-generated memory-location
+        # artifacts (very large ints), and treats any already-small integer
+        # id, even an accidental duplicate like this, as deliberate and
+        # leaves it alone. Fix it ourselves: give RH's per-measure voices
+        # 1/2 and LH's 3/4 (offset by 2), assigned in each measure's own
+        # voice order (lead inserted before secondary into `p`, above, so
+        # this reproduces the same lead/secondary order per measure).
+        voice_id_base = 0 if staff == "RH" else 2
+        for m in p.getElementsByClass(stream.Measure):
+            for i, v in enumerate(m.getElementsByClass(stream.Voice)):
+                v.id = voice_id_base + i + 1
         score.insert(0, p)
 
     present_parts = list(score.parts)
@@ -826,6 +884,45 @@ def build_score(grouped: dict[tuple[str, int], list[list[RawNote]]], ticks_per_b
                                           name="Piano", symbol="brace", barTogether=True))
 
     return score
+
+
+def _add_part_symbol_brace(xml_path: str) -> None:
+    """Patch a real, acknowledged gap in music21's own exporter: joining two
+    PartStaffs into one multi-staff MusicXML <part> (see build_score's
+    comment - confirmed via PartStaffExporterMixin.joinPartStaffs(), which
+    correctly emits a single <part>/<score-part> and <staves>2</staves>)
+    never emits the <part-symbol> element that formally declares those
+    staves braced into one grand-staff keyboard instrument - the exporter's
+    own source literally has "# TODO: part-symbol" left unimplemented right
+    where <staves> is written (m21ToXml.py,
+    setMxAttributesObjectForStartOfMeasure). Without it, an importer sees
+    two correctly-numbered staves but no explicit brace/instrument-grouping
+    signal - confirmed to be exactly what made Dorico's import "completely
+    unusable" (the user's own words) even though the <part> count was
+    already correct. Post-processes the written file directly (there is no
+    music21-level hook for this) by inserting
+    "<part-symbol>brace</part-symbol>" right after the first <staves> tag,
+    per the MusicXML schema's required <attributes> child order (staves,
+    then part-symbol, then instruments/clef). No-op if the file has only one
+    staff (a Hands=Left/Right-only run - nothing to brace) or already has a
+    <part-symbol> (a future music21 fix implementing the TODO above)."""
+    with open(xml_path, "r", encoding="utf-8") as f:
+        xml_text = f.read()
+    if "<part-symbol>" in xml_text or "<staves>" not in xml_text:
+        return
+    patched, count = re.subn(
+        r"(<staves>\d+</staves>)",
+        r"\1<part-symbol>brace</part-symbol>",
+        xml_text, count=1,
+    )
+    if count:
+        with open(xml_path, "w", encoding="utf-8") as f:
+            f.write(patched)
+        print("NOTE: patched missing <part-symbol>brace</part-symbol> onto the joined "
+              "grand-staff part (music21 itself never emits this - see "
+              "_add_part_symbol_brace) - this is what tells an importer like Dorico "
+              "the two staves are one braced piano instrument, not two independent ones.",
+              file=sys.stderr)
 
 
 def main():
@@ -842,8 +939,14 @@ def main():
                      help="Track index or exact track name to read (default: auto-detect by 'OrchPiano' in the name)")
     ap.add_argument("--channel-base", type=int, default=None,
                      help="0-indexed base channel (OrchPiano's chanBase - 1). Default: auto-detect as the lowest channel used on the track.")
-    ap.add_argument("--time-signature", default="4/4",
-                     help="Time signature for notation purposes (default 4/4) - OrchPiano's captured MIDI carries no time-signature meta event.")
+    ap.add_argument("--time-signature", default=None,
+                     help="Time signature for notation purposes. Default: auto-detect from the "
+                          "capture's own time-signature meta event(s) (OrchCapture has embedded "
+                          "these since 2026-09-06); falls back to 4/4 with a warning if the "
+                          "capture has none (e.g. an older capture, or the host never reported a "
+                          "meter). Passing this explicitly overrides auto-detection entirely - "
+                          "and only ever produces ONE signature at the start, even if the "
+                          "capture itself changed meter mid-piece.")
     ap.add_argument("--max-hand-span", type=int, default=14,
                      help="Assumed OrchPiano 'Max Hand Span (st)' for this take, in semitones (default 14, OrchPiano's own default). "
                           "Phase 2 enforces this against real overlapping note timing, not just each onset group's own snapshot.")
@@ -866,6 +969,19 @@ def main():
     raw_notes, channel_base = extract_notes(track, args.channel_base)
     print(f"Read {len(raw_notes)} notes from channel-base {channel_base} "
           f"(1-indexed MIDI ch {channel_base + 1}..{channel_base + 4}).")
+
+    if args.time_signature is not None:
+        time_sigs = [(0, args.time_signature)]
+    else:
+        time_sigs = extract_time_signatures(mid)
+        if not time_sigs:
+            print("WARNING: no time-signature meta event found in the capture; defaulting to "
+                  "4/4. Pass --time-signature to override (or re-capture with a current "
+                  "OrchCapture build, which embeds the host's own meter).", file=sys.stderr)
+            time_sigs = [(0, "4/4")]
+        else:
+            print(f"Detected time signature(s) from capture: "
+                  f"{', '.join(sig for _, sig in time_sigs)}.")
 
     _guard_hand_playability(raw_notes, args.max_hand_span, args.max_hand_notes)
     _report_hand_crossing(raw_notes, mid.ticks_per_beat)
@@ -909,9 +1025,10 @@ def main():
     if dynamics_marks:
         print(f"Computed {len(dynamics_marks)} dynamics mark(s) from velocity.")
 
-    score = build_score(grouped, mid.ticks_per_beat, args.time_signature, dynamics_marks,
+    score = build_score(grouped, mid.ticks_per_beat, time_sigs, dynamics_marks,
                         notation_scale=args.notation_scale)
     score.write("musicxml", fp=args.output_path)
+    _add_part_symbol_brace(args.output_path)
     print(f"Wrote {args.output_path}")
 
 

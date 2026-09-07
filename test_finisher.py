@@ -137,7 +137,7 @@ def test_quantize_does_not_invent_tuplets_from_straight_32nd_notes():
     notes = [RawNote(channel_offset=0, pitch=p, velocity=80, start_tick=s, end_tick=e)
              for p, s, e in real_excerpt]
     grouped = _group_by_line_and_onset(notes)
-    score = build_score(grouped, 960, "4/4")
+    score = build_score(grouped, 960, [(0, "4/4")])
     rh_notes = list(score.parts[0].flatten().notes)
     tupleted = [n for n in rh_notes if n.duration.tuplets]
     check(not tupleted,
@@ -245,8 +245,8 @@ def test_notation_scale_doubles_offsets_and_durations():
     ]
     grouped = _group_by_line_and_onset(notes)
 
-    unscaled = build_score(grouped, tpb, "4/4", notation_scale=1.0)
-    scaled = build_score(grouped, tpb, "4/4", notation_scale=2.0)
+    unscaled = build_score(grouped, tpb, [(0, "4/4")], notation_scale=1.0)
+    scaled = build_score(grouped, tpb, [(0, "4/4")], notation_scale=2.0)
 
     def offsets_and_durations(score):
         pairs = []
@@ -325,7 +325,7 @@ def test_collapse_octave_tremolo_gets_a_tremolo_spanner_in_the_score():
                              start_tick=i * step, end_tick=(i + 1) * step))
     grouped = _group_by_line_and_onset(notes)
     _collapse_octave_tremolos(grouped, tpb)
-    score = build_score(grouped, tpb, "4/4")
+    score = build_score(grouped, tpb, [(0, "4/4")])
 
     spanners = list(score.recurse().getElementsByClass(expressions.TremoloSpanner))
     check(len(spanners) == 1, f"tremolo spanner: exactly one TremoloSpanner in the score (got {len(spanners)})")
