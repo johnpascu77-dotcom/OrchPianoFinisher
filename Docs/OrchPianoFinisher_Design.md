@@ -889,4 +889,44 @@ octave-doubled bass notes landing on the identical MIDI note number between hand
 
 Updated the write_midi test for the new single-channel shape. 18/18 tests green. Real full-take
 re-run: exactly one track/one channel/3668 notes, matching the reference files' own structure
-byte-for-byte in shape. Sent back to the user - not yet confirmed in Dorico.
+byte-for-byte in shape. Sent back to the user - MIDI landed correctly, single instrument
+recognized.
+
+## 21. Desktop GUI + track auto-detect fix, for testing with OTHER pieces
+
+2026-09-08. User asked to test with other pieces, and directly: "is the finisher universal, or
+does it have to be tweaked for each piece?" Answer, given honestly rather than assumed: mostly
+universal (channel-base and time-signature detection, and the whole safety-net/single-instrument
+pipeline, all adapt automatically to whatever a capture contains) - but two real, genuine
+exceptions exist BECAUSE the capture carries no record of them: Max Hand Span/Notes-per-Hand
+(must match whatever OrchPiano's own UI sliders were actually set to for that specific take) and
+`--notation-scale` (only relevant for an MPL-driven take with a too-fine native grid, irrelevant
+otherwise). See `README.md` for the fuller answer.
+
+**Real gap found and fixed while answering this**: `find_orchpiano_track()`'s auto-detect has
+ALWAYS required the content track be named literally "OrchPiano" - but every single real capture
+tested this whole project is named "Grand Piano" (OrchCapture names the track after whatever the
+Bitwig track itself is called, which the user is free to name anything) - meaning `--track` has
+had to be passed by hand on every single CLI run, all session, defeating "just point it at a
+capture." Fixed with a name-INDEPENDENT fallback: if no name match is found and exactly one track
+in the file has any note events at all, that track is used automatically regardless of its name -
+matches OrchCapture's own consistent export shape (one meta track with zero notes + one content
+track with all of them) without depending on what anyone happened to name the Bitwig track.
+
+**`finisher_gui.py`** (new file): a `tkinter` desktop GUI, zero extra dependencies (tkinter ships
+with a standard CPython install, matching this repo's own "zero-dependency script" ethos -
+`test_finisher.py`'s own docstring says the same about avoiding pytest). Refactored `main()`'s own
+CLI body into a new `process_capture(...)` function taking the same parameters as keyword
+arguments instead of an argparse `Namespace`, so the GUI calls the EXACT SAME pipeline logic
+directly - no duplicated logic, no shelling out to the CLI. The GUI: browsing to (or typing/
+pasting) an input file auto-populates a track dropdown (labeled with name + note count) and
+pre-selects the same auto-detected track the CLI would use, shows the auto-detected time
+signature, pre-fills OrchPiano's own defaults for hand-span/notes-per-hand, defaults the output
+format to MIDI (per §20's decision) with MusicXML still available, and redirects
+`stdout`/`stderr` into a scrolled log pane via `contextlib.redirect_stdout/stderr` so the same
+NOTE:/WARNING: diagnostic messages the CLI prints are visible without a terminal. `SystemExit`
+(the CLI's own way of reporting a bad input) and any other exception are caught and shown in the
+log rather than crashing the GUI process. Smoke-tested end to end (not just constructed): loaded
+a real capture, ran the full pipeline through the GUI's own `_run()`, confirmed the written MIDI
+file (1834 real notes, correct structure) and the log content - and confirmed the error path
+(a missing input file) fails gracefully with a message instead of crashing.

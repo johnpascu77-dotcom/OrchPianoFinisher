@@ -139,9 +139,32 @@ def find_orchpiano_track(mid: mido.MidiFile, track_arg: str | None):
     candidates = [tr for tr in mid.tracks
                   if (name := next((m.name for m in tr if m.type == "track_name"), None))
                   and "orchpiano" in name.lower()]
-    if not candidates:
-        raise SystemExit("No track named 'OrchPiano' found - pass --track <index or exact name>")
-    return _pick_among(candidates, "'OrchPiano'-named")
+    if candidates:
+        return _pick_among(candidates, "'OrchPiano'-named")
+
+    # 2026-09-08: name-based matching alone is NOT universal - every real
+    # capture tested this whole project has the content track named
+    # "Grand Piano" (OrchCapture names the track after whatever the Bitwig
+    # track itself is called, which the user is free to name anything),
+    # never literally "OrchPiano". Requiring --track by hand on every single
+    # run defeated the whole point of "just point it at a capture". Fall
+    # back to a name-INDEPENDENT heuristic instead: OrchCapture's own export
+    # is consistently exactly one meta track (no notes) + one content track
+    # (all the real notes) - if there is exactly ONE track with any note
+    # events at all, regardless of its name, that's unambiguously the one.
+    with_notes = [tr for tr in mid.tracks if _has_note_events(tr)]
+    if len(with_notes) == 1:
+        name = next((m.name for m in with_notes[0] if m.type == "track_name"), None)
+        print(f"NOTE: no track named 'OrchPiano' - auto-selected track "
+              f"{mid.tracks.index(with_notes[0])} (named {name!r}) as the only one with any "
+              "notes.", file=sys.stderr)
+        return with_notes[0]
+
+    if len(with_notes) > 1:
+        raise SystemExit(f"No track named 'OrchPiano' and {len(with_notes)} tracks contain "
+                          "notes - pass --track <index or exact name> to disambiguate")
+    raise SystemExit("No track named 'OrchPiano' found and no track contains any notes - "
+                      "pass --track <index or exact name>")
 
 
 def extract_time_signatures(mid: mido.MidiFile) -> list[tuple[int, str]]:
@@ -1084,15 +1107,33 @@ def main():
                           "Double-Durations workflow. Does not affect the safety-net guards, "
                           "which work in raw ticks regardless of this setting.")
     args = ap.parse_args()
+    process_capture(args.input_mid, args.output_path, track=args.track,
+                    channel_base=args.channel_base, time_signature=args.time_signature,
+                    max_hand_span=args.max_hand_span, max_hand_notes=args.max_hand_notes,
+                    no_dynamics=args.no_dynamics, notation_scale=args.notation_scale)
 
-    mid = mido.MidiFile(args.input_mid)
-    track = find_orchpiano_track(mid, args.track)
-    raw_notes, channel_base = extract_notes(track, args.channel_base)
-    print(f"Read {len(raw_notes)} notes from channel-base {channel_base} "
-          f"(1-indexed MIDI ch {channel_base + 1}..{channel_base + 4}).")
 
-    if args.time_signature is not None:
-        time_sigs = [(0, args.time_signature)]
+def process_capture(input_mid: str, output_path: str, *, track: str | None = None,
+                    channel_base: int | None = None, time_signature: str | None = None,
+                    max_hand_span: int = 14, max_hand_notes: int = 4,
+                    no_dynamics: bool = False, notation_scale: float = 1.0) -> None:
+    """The actual end-to-end pipeline `main()` drives from argparse - pulled
+    out as its own function (2026-09-08) so `finisher_gui.py` can call it
+    directly with values collected from its own form fields, instead of
+    duplicating this logic or shelling out to the CLI. Every parameter here
+    is the same thing its matching `--flag` documents in `main()`'s
+    argparse setup - see there for the full explanation of each one.
+    Raises `SystemExit` on a bad input, same as running the CLI (the GUI
+    catches this itself and shows it as an error rather than letting the
+    whole process die)."""
+    mid = mido.MidiFile(input_mid)
+    found_track = find_orchpiano_track(mid, track)
+    raw_notes, resolved_channel_base = extract_notes(found_track, channel_base)
+    print(f"Read {len(raw_notes)} notes from channel-base {resolved_channel_base} "
+          f"(1-indexed MIDI ch {resolved_channel_base + 1}..{resolved_channel_base + 4}).")
+
+    if time_signature is not None:
+        time_sigs = [(0, time_signature)]
     else:
         time_sigs = extract_time_signatures(mid)
         if not time_sigs:
@@ -1104,7 +1145,7 @@ def main():
             print(f"Detected time signature(s) from capture: "
                   f"{', '.join(sig for _, sig in time_sigs)}.")
 
-    _guard_hand_playability(raw_notes, args.max_hand_span, args.max_hand_notes)
+    _guard_hand_playability(raw_notes, max_hand_span, max_hand_notes)
     _report_hand_crossing(raw_notes, mid.ticks_per_beat)
 
     grouped = _group_by_line_and_onset(raw_notes)
@@ -1123,15 +1164,15 @@ def main():
     _fix_voice_stem_order(grouped)
     _guard_staggered_overlaps(grouped)
 
-    if args.output_path.lower().endswith((".mid", ".midi")):
+    if output_path.lower().endswith((".mid", ".midi")):
         # MIDI path skips build_score()/music21 entirely - the dynamics
         # marks are a MusicXML-only concern (<dynamics> text; raw velocity
         # is still in the file either way). It also skips the octave-tremolo
         # notation collapse below - real audio playback needs the actual
         # alternating notes, not their two-note notated shorthand.
-        write_midi(grouped, mid.ticks_per_beat, args.output_path, notation_scale=args.notation_scale,
+        write_midi(grouped, mid.ticks_per_beat, output_path, notation_scale=notation_scale,
                   time_sigs=time_sigs)
-        print(f"Wrote {args.output_path}")
+        print(f"Wrote {output_path}")
         return
 
     # MusicXML path only, and only from here on: OrchPiano's octave-tremolo
@@ -1146,16 +1187,16 @@ def main():
     # denser pre-scale grid - the marks themselves are computed at unscaled
     # offsets here and get carried along by build_score's augmentOrDiminish
     # at the end, same as every note.
-    dynamics_marks = [] if args.no_dynamics else compute_dynamics_marks(
-        raw_notes, mid.ticks_per_beat, min_hold_beats=1.0 / args.notation_scale)
+    dynamics_marks = [] if no_dynamics else compute_dynamics_marks(
+        raw_notes, mid.ticks_per_beat, min_hold_beats=1.0 / notation_scale)
     if dynamics_marks:
         print(f"Computed {len(dynamics_marks)} dynamics mark(s) from velocity.")
 
     score = build_score(grouped, mid.ticks_per_beat, time_sigs, dynamics_marks,
-                        notation_scale=args.notation_scale)
-    score.write("musicxml", fp=args.output_path)
-    _add_part_symbol_brace(args.output_path)
-    print(f"Wrote {args.output_path}")
+                        notation_scale=notation_scale)
+    score.write("musicxml", fp=output_path)
+    _add_part_symbol_brace(output_path)
+    print(f"Wrote {output_path}")
 
 
 if __name__ == "__main__":
