@@ -858,3 +858,35 @@ end to end after all three fixes: MusicXML now shows `<staves>2</staves>`, `<par
 and 428 real chord merges; MIDI now has the exact 2-track/multi-channel shape confirmed to
 auto-recognize, plus a correctly embedded 6/8 time signature. Sent both back to the user for a
 real Dorico re-check - not yet confirmed on that end.
+
+**Live re-check, same day: fix #2 above wasn't enough, and a scope decision.** The RH/LH-on-
+separate-channels-in-one-track structure STILL came in as two independent Piano instances, not
+one shared grand staff (same real Import Options test, same result). The user also directly
+compared the MusicXML and MIDI outputs on the same passage (the bars 85-87 octave-tremolo roll)
+and found music21's own notation choices genuinely worse than what Dorico's own MIDI import
+derives from the same underlying notes - not just the already-known engraving problems, a
+specific concrete example of MusicXML notating the roll badly compared to the MIDI version of
+the identical passage. **Decision: MIDI is the sole output going forward** ("we'll stick to
+MIDI as the output, to preserve our energy and temper") - `build_score()`/the MusicXML path is
+not deprecated or removed, but is no longer where further engraving-quality effort goes.
+
+Root-caused the actual single-instrument trigger properly this time: pulled several genuine,
+already-correctly-recognized piano MIDI files (not this project's own output) and inspected
+them directly - a real piano prelude, several guitar/keys riff files from a sample library.
+Every one is **one track, one channel**, both hands' pitches simply mixed together in one flat
+stream (one file's own pitch range, 24-75, plainly spans bass and treble registers on that
+single channel). There is no MIDI-level marker at all for "these N channels are one
+instrument's N staves" - channel/track COUNT itself is the only signal an importer has, and 2
+of anything reads as 2 instruments, regardless of shared track or naming. **Fixed**:
+`write_midi()` now merges BOTH hands onto ONE channel too (not just one track) - OrchPiano's own
+hand-split is still fully used by every per-hand safety-net guard upstream in `main()` (span,
+count, staggered-overlap), only the OUTPUT channel tag is dropped, deferring hand ASSIGNMENT to
+Dorico's own mature import-time splitter, exactly as it already does correctly for any genuine
+performance recording. A same-pitch overlap guard that previously ran per-hand now runs across
+both hands together (sharing a channel makes a cross-hand collision exactly as ambiguous to a
+receiver as a same-hand one always was) - found 18 real instances on the full take (plausible:
+octave-doubled bass notes landing on the identical MIDI note number between hands).
+
+Updated the write_midi test for the new single-channel shape. 18/18 tests green. Real full-take
+re-run: exactly one track/one channel/3668 notes, matching the reference files' own structure
+byte-for-byte in shape. Sent back to the user - not yet confirmed in Dorico.

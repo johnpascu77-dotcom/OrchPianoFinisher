@@ -681,9 +681,10 @@ def write_midi(grouped: dict[tuple[str, int], list[list[RawNote]]], ticks_per_be
                output_path: str, notation_scale: float = 1.0,
                time_sigs: list[tuple[int, str]] = ()) -> None:
     """Write the corrected (post safety-net) note data as a plain Standard
-    MIDI File - RH channel 0, LH channel 1, voice 1 and voice 2 merged back
-    into one polyphonic line per hand - instead of a music21-built MusicXML
-    score.
+    MIDI File - one track, one channel, both hands merged into one flat
+    polyphonic line (matching the exact shape every genuine piano MIDI file
+    uses, so Dorico's own import auto-recognizes it as a single instrument)
+    - instead of a music21-built MusicXML score.
 
     2026-09-05: added because music21's MusicXML writer produces genuinely
     poor engraving for this piano-reduction shape once tested against a real
@@ -695,21 +696,39 @@ def write_midi(grouped: dict[tuple[str, int], list[list[RawNote]]], ticks_per_be
     Re-importing a plain MIDI file lets Dorico's own, more mature MIDI-import
     engine choose voices/stems/beaming itself.
 
-    2026-09-08: BOTH hands now share ONE track (still on separate channels,
-    0/1) instead of one track each, and a leading meta-only track carries
-    the detected time signature(s) - matching the exact 2-track shape
-    (1 meta track + 1 multi-channel content track) OrchCapture's own raw
-    output already uses, which Dorico's MIDI import auto-recognizes as a
-    single piano instrument. The PREVIOUS 2-content-track shape (one track
-    named "RH", one named "LH") does not get that recognition at all -
-    confirmed directly: Dorico's own Import Options showed it as two
-    separate destination-instrument slots, and assigning "Piano" to both
-    produced two independent Piano instances, not one shared grand staff
-    (assigning Treble/Bass clef roles instead ran a different, worse
-    conversion algorithm - the user's own real test, not a guess). This
-    also fixes a related, separately-reported bug: the previous version
-    never wrote a time-signature meta event at all, so any importer
-    defaulted to 4/4 regardless of the capture's own real meter.
+    2026-09-08, take 1 (kept both hands on separate channels 0/1 in one
+    shared track): still came in as two separate Piano instances, not one
+    shared grand staff - the 2-CHANNEL structure was still telling Dorico
+    "these are two different things," independent of track count.
+
+    2026-09-08, take 2 (this version) - both hands now share ONE CHANNEL
+    too, not just one track. Checked what a genuine, already-correctly-
+    recognized piano MIDI file actually looks like (several real files -
+    a Chopin-style prelude, guitar/keys riffs from a sample library -
+    inspected directly, not guessed): every one of them is ONE track, ONE
+    channel, both hands' pitches simply mixed together in one flat stream
+    (one real file's own pitch range, 24-75, plainly spans bass and treble
+    registers on that single channel). That is what actually triggers
+    Dorico's auto-recognition: it sees one wide-range channel from a
+    keyboard-shaped source and runs its OWN grand-staff hand-splitting on
+    it at import time, exactly as it would for any real performance -
+    there is no MIDI-level "these N channels are one instrument's N
+    staves" marker for an importer to key off at all; channel/track COUNT
+    itself is the only signal, and 2 of anything reads as 2 instruments.
+    OrchPiano's own reduction (span/difficulty/doubling-aware selection of
+    WHICH notes survive) is still the valuable, hard part and is fully
+    preserved; only the explicit per-note "this is RH/LH" channel tag is
+    now dropped for output, deferring HAND ASSIGNMENT to Dorico's own
+    mature import-time splitter - the same easier, well-solved task it
+    already does correctly for every genuine piano recording.
+
+    A leading meta-only track still carries the detected time
+    signature(s), matching real captures' own 2-track shape (1 meta +
+    1 content track) - this part was already correct and unaffected. This
+    also carries forward the earlier fix for a related, separately-
+    reported bug: the version before either of these takes never wrote a
+    time-signature meta event at all, so any importer defaulted to 4/4
+    regardless of the capture's own real meter.
 
     Trade-off the user explicitly accepted for the MIDI path: no
     velocity-derived <dynamics> marks (MusicXML-only - raw velocity is
@@ -746,52 +765,58 @@ def write_midi(grouped: dict[tuple[str, int], list[list[RawNote]]], ticks_per_be
         meta.append(msg)
     meta.append(mido.MetaMessage("end_of_track", time=0))
 
-    # (tick, is_note_on, pitch, channel, velocity) across BOTH hands, one
-    # shared track - sorting is_note_on False before True at an equal tick
-    # lets a note ending exactly when another (on the OTHER hand's channel,
-    # same tick) begins produce a clean off-then-on pair in the merged
-    # stream rather than an arbitrary interleave.
-    events: list[tuple[int, bool, int, int, int]] = []
-    any_notes = False
-    for staff, channel in (("RH", 0), ("LH", 1)):
-        notes: list[RawNote] = []
+    # 2026-09-08: ALL notes - both hands - now share ONE channel (0), not
+    # RH=0/LH=1, matching what every genuine piano MIDI file actually looks
+    # like (see this function's own docstring). channel_offset/staff is
+    # still used above to pull notes out of `grouped`, and OrchPiano's own
+    # per-hand safety-net guards (span/count/staggered-overlap) already ran
+    # on the real per-hand data upstream in main() before this function ever
+    # sees it - only the OUTPUT channel assignment changes here.
+    notes: list[RawNote] = []
+    for staff in ("RH", "LH"):
         for voice_num in (1, 2):
             for group in grouped.get((staff, voice_num), []):
                 notes.extend(group)
-        if not notes:
-            # Nothing landed on this hand at all (Hands=Left/Right run) - an
-            # empty staff is legitimate, not an error; just skip it.
+
+    if notes:
+        # Same-pitch overlap guard now runs across BOTH hands together, not
+        # per-hand - sharing one channel means a same-pitch collision
+        # between a RH and an LH note (e.g. a doubled octave landing on the
+        # identical MIDI note number, or a hand-crossing passage) is now
+        # exactly as ambiguous to a receiver as a same-hand one always was.
+        cross_hand_truncated = _guard_cross_voice_pitch_overlaps(notes)
+        if cross_hand_truncated:
+            print(f"NOTE: truncated {cross_hand_truncated} same-pitch overlap(s) across the "
+                  "merged single-channel output (both hands now share one channel - a same-"
+                  "pitch collision between them is exactly as ambiguous to a receiver as a "
+                  "same-hand one).", file=sys.stderr)
+
+    # (tick, is_note_on, pitch, velocity) - sorting is_note_on False before
+    # True at an equal tick lets a note ending exactly when another begins
+    # produce a clean off-then-on pair rather than an ambiguous overlap.
+    events: list[tuple[int, bool, int, int]] = []
+    for n in notes:
+        start = round(n.start_tick * notation_scale)
+        end = round(n.end_tick * notation_scale)
+        if end <= start:
+            # A degenerate zero/negative-length note left behind by the
+            # overlap guard truncating right down to its own onset -
+            # nothing audible or notatable to write.
             continue
-        any_notes = True
+        events.append((start, True, n.pitch, n.velocity))
+        events.append((end, False, n.pitch, 0))
 
-        cross_voice_truncated = _guard_cross_voice_pitch_overlaps(notes)
-        if cross_voice_truncated:
-            print(f"NOTE: truncated {cross_voice_truncated} cross-voice same-pitch overlap(s) "
-                  f"on {staff} before MIDI export (voice 1/voice 2 merge can expose these; "
-                  "neither voice's own overlap guard ever sees them alone).", file=sys.stderr)
-
-        for n in notes:
-            start = round(n.start_tick * notation_scale)
-            end = round(n.end_tick * notation_scale)
-            if end <= start:
-                # A degenerate zero/negative-length note left behind by the
-                # cross-voice guard truncating right down to its own onset -
-                # nothing audible or notatable to write.
-                continue
-            events.append((start, True, n.pitch, channel, n.velocity))
-            events.append((end, False, n.pitch, channel, 0))
-
-    if any_notes and events:
+    if events:
         events.sort(key=lambda e: (e[0], e[1]))
         track = mido.MidiTrack()
         track.name = "Grand Piano"
         out.tracks.append(track)
         last_tick = 0
-        for tick, is_on, pitch, channel, velocity in events:
+        for tick, is_on, pitch, velocity in events:
             delta = tick - last_tick
             last_tick = tick
             track.append(mido.Message("note_on" if is_on else "note_off",
-                                       note=pitch, velocity=velocity, time=delta, channel=channel))
+                                       note=pitch, velocity=velocity, time=delta, channel=0))
     out.save(output_path)
 
 
@@ -1023,9 +1048,10 @@ def main():
     ap.add_argument("input_mid", help="Captured MIDI file (e.g. from OrchCapture)")
     ap.add_argument("output_path",
                      help="Output path. A .mid/.midi extension writes a plain Standard MIDI "
-                          "File (RH/LH on one shared track, channels 0/1, recognized by "
-                          "Dorico's MIDI import as a single piano instrument) instead of "
-                          "MusicXML - use this when music21's own notation (stems/voices/"
+                          "File (RH/LH merged onto one track/one channel, matching every "
+                          "genuine piano MIDI file's own shape, recognized by Dorico's MIDI "
+                          "import as a single piano instrument) instead of MusicXML - use "
+                          "this when music21's own notation (stems/voices/"
                           "beaming) looks worse than letting Dorico's MIDI import decide "
                           "those on its own; the "
                           "merge/safety-net corrections still apply either way. Any other "

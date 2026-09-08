@@ -215,23 +215,30 @@ def test_write_midi_merges_voices_and_scales_ticks():
     # trading away <dynamics> marks and explicit lead/secondary voice
     # tagging, a trade the user explicitly accepted.
     #
-    # 2026-09-08: RH and LH now share ONE content track (channels 0/1) behind
-    # a leading meta-only track, not one track each - live-found that the
-    # previous two-track shape (tracks literally named "RH"/"LH") does NOT
-    # get Dorico's automatic single-piano-instrument recognition at all
-    # (confirmed directly: Import Options showed two separate destination-
-    # instrument slots; assigning "Piano" to both produced two independent
-    # instances, not a shared grand staff). This exact "one meta track + one
-    # multi-channel content track" shape matches OrchCapture's own raw
-    # output, which DOES get recognized correctly.
+    # 2026-09-08 take 1: RH and LH shared one content track but stayed on
+    # separate channels (0/1) - live-found this STILL doesn't get Dorico's
+    # single-piano-instrument recognition (Import Options showed two
+    # separate destination-instrument slots regardless of track count;
+    # channel count alone reads as "N instruments").
     #
-    # This test checks what a silent regression could break: (1) voice 1 and
-    # voice 2 notes on the same hand both land on that hand's single MIDI
-    # channel within the ONE shared track (the whole point - Dorico
-    # re-derives voices on its own), (2) notation_scale multiplies tick
-    # positions/durations directly (ticks_per_beat held fixed), the
-    # MIDI-domain equivalent of Bitwig's Content Scaling, and (3) that scale
-    # also applies to the embedded time-signature tick position.
+    # 2026-09-08 take 2 (this version): both hands now share ONE CHANNEL
+    # too, behind a leading meta-only track. Checked several genuine,
+    # already-correctly-recognized piano MIDI files directly (not guessed):
+    # every one is one track, one channel, both hands mixed together in one
+    # flat stream - that is what actually triggers the auto-recognition.
+    # OrchPiano's own hand-split is still used for the SAFETY-NET guards
+    # upstream (per-hand span/count/overlap, already run in main() before
+    # this function ever sees the data); only the OUTPUT channel tag is now
+    # dropped, deferring hand ASSIGNMENT to Dorico's own import-time
+    # splitter, same as it does for any genuine performance recording.
+    #
+    # This test checks what a silent regression could break: (1) voice 1
+    # and voice 2 notes on the same hand, from BOTH hands, all land on the
+    # one shared channel in the one shared content track (2) notation_scale
+    # multiplies tick positions/durations directly (ticks_per_beat held
+    # fixed), the MIDI-domain equivalent of Bitwig's Content Scaling, and
+    # (3) that scale also applies to the embedded time-signature tick
+    # position.
     tpb = 960
     notes = [
         RawNote(channel_offset=0, pitch=72, velocity=80, start_tick=0, end_tick=480),   # RH voice 1
@@ -256,15 +263,16 @@ def test_write_midi_merges_voices_and_scales_ticks():
             return sorted(result)
 
         merged = events(out.tracks[1])
-        # RH's two voices (channel 0) AND LH's voice (channel 1) all land in
-        # the ONE content track, ticks doubled (scale=2.0).
-        merged_ok = merged == [(0, "note_on", 48, 1), (0, "note_on", 72, 0),
+        all_channel_0 = all(e[3] == 0 for e in merged)
+        # Both RH voices AND the LH voice all land in the ONE content track
+        # on the ONE shared channel, ticks doubled (scale=2.0).
+        merged_ok = merged == [(0, "note_on", 48, 0), (0, "note_on", 72, 0),
                                 (960, "note_off", 72, 0), (960, "note_on", 60, 0),
-                                (1920, "note_off", 48, 1), (1920, "note_off", 60, 0)]
+                                (1920, "note_off", 48, 0), (1920, "note_off", 60, 0)]
         ts = [m for m in out.tracks[0] if m.type == "time_signature"]
         ts_ok = len(ts) == 1 and ts[0].numerator == 6 and ts[0].denominator == 8
-        check(out.ticks_per_beat == tpb and merged_ok,
-              f"write_midi: voices merge into one shared track and ticks scale exactly (got {merged})")
+        check(out.ticks_per_beat == tpb and merged_ok and all_channel_0,
+              f"write_midi: both hands merge onto one shared channel and ticks scale exactly (got {merged})")
         check(ts_ok, f"write_midi: time signature embedded in the meta track (got {ts})")
 
 
