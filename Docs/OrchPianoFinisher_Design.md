@@ -799,3 +799,62 @@ opening E-major-chord passage (channel 3 = LH lead) now plays as `{E, B, E}` (ro
 octave - the 3rd correctly omitted, matching the MuseScore reference's own convention) in
 one hand, not split across two hands or collapsed to a bare octave. Both `kdeHandSplit`'s
 gap-based rewrite and the per-hand role re-tagging fix are live-confirmed.
+
+## 20. First full-take run - `_collapse_octave_tremolos` fires on real data for the first time, plus three real fixes from the user's own direct Dorico test
+
+2026-09-08. First time the Finisher ran on a genuinely complete, full-length take
+(`OrchCapture_Grand Piano_1788867041686.mid`, ~185s, 1948 notes) rather than a short isolated
+passage. `_collapse_octave_tremolos` (built and unit-tested 2026-09-06, never exercised against
+real data since no earlier capture had an actual octave-tremolo run) fired for real: one run
+correctly collapsed into a genuine `<tremolo type="start/stop">2</tremolo>` pair - confirms
+yesterday's whole multi-day figure-detection fix chain (the 32nd-note grouping-window fix,
+`PendingTremolo`'s `seq` fix) actually pays off end-to-end through notation output too, not just
+the raw MIDI capture.
+
+The user's own direct Dorico test on this full take then found three real, concrete problems:
+
+1. **The "double vision" MusicXML problem, finally root-caused (not `arpeggioRespace` - that was
+   reverted, correctly, per §earlier).** Real screenshots (bars 36-45) showed multi-colored
+   noteheads stacked at identical rhythmic positions throughout dense passages - Dorico's own
+   per-voice coloring exposing that voice 1 and voice 2 were genuinely being notated as two
+   independent voices at instants where they attack together. Root cause: `CHANNEL_ROLE`'s voice
+   1/voice 2 split exists to represent two lines with independent RHYTHM (one holds while the
+   other moves) - but OrchPiano's own real 4-channel output frequently has BOTH lines attack at
+   the exact same tick (multiple real simultaneous notes at a fast attack), and nothing in the
+   Finisher ever recognized "these two lines just agreed to attack together right now, so this one
+   instant should read as ONE chord, not two coincident voices." **Fixed**: new
+   `_merge_coincident_attacks(grouped)` - for every onset shared EXACTLY between a hand's voice 1
+   and voice 2 groups, combines all their notes into one chord living in voice 1 (up-stem,
+   convention), removing voice 2's own entry for that instant entirely (a rest fills the gap once
+   `makeRests` runs, same as any other onset that voice legitimately has nothing to do). Runs
+   BEFORE `_fix_voice_stem_order` - once merged, there's nothing left for that pass to swap at
+   that tick. Harmless for the plain-MIDI path (`write_midi()` already flattens both voices back
+   into one line regardless of which group a note sits in, so merging changes zero notes there) -
+   runs unconditionally rather than being format-gated. On the real full take: **428 same-onset
+   attacks merged** - confirms the user's own "this is happening throughout the piece" from the
+   original report, not an isolated passage. New dedicated test
+   (`test_merge_coincident_attacks_combines_same_onset_voices_into_one_chord`) confirms both the
+   merge itself and that a genuinely later, unrelated voice-2-only attack is correctly left alone.
+
+2. **The plain MIDI output still isn't recognized as one piano instrument either - a genuinely
+   separate problem from the MusicXML `<part-symbol>` fix (§19), which only applies to that
+   format.** The user's own real test: Dorico's MIDI Import Options showed the file's two tracks
+   (named "RH"/"LH") as two separate destination-instrument slots; assigning "Piano" to both
+   produced two INDEPENDENT Piano instances (each its own grand staff), not one shared instrument;
+   assigning Treble/Bass clef roles instead ran a visibly worse conversion algorithm. Compared
+   directly against OrchCapture's own raw output (which the user confirmed DOES get auto-
+   recognized as one piano) - that file's own structure is exactly 2 tracks: one meta-only track,
+   and ONE content track carrying every channel merged together, not one track per hand. **Fixed**:
+   `write_midi()` rewritten to emit that same shape - RH and LH now share ONE content track
+   (still on separate channels, 0/1) behind a leading meta-only track, instead of one track each.
+3. **The MIDI output also never carried a time-signature meta event at all** (a separate, simpler
+   bug hiding inside the same rewrite) - any importer defaulted to 4/4 regardless of the capture's
+   real meter. Fixed in the same pass: the meta track now carries the already-detected
+   `time_sigs` (§19's auto-detection), scaled by `notation_scale` the same way note ticks are.
+
+Updated `test_write_midi_merges_voices_and_scales_ticks` for the new 2-track (not 3-track) shape
+and added an explicit time-signature-embedding assertion. 18/18 tests green. Re-ran the full take
+end to end after all three fixes: MusicXML now shows `<staves>2</staves>`, `<part-symbol>brace</part-symbol>`,
+and 428 real chord merges; MIDI now has the exact 2-track/multi-channel shape confirmed to
+auto-recognize, plus a correctly embedded 6/8 time signature. Sent both back to the user for a
+real Dorico re-check - not yet confirmed on that end.

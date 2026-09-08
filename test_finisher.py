@@ -19,6 +19,7 @@ from orchpiano_finisher import (
     RawNote,
     _guard_hand_playability,
     _fix_voice_stem_order,
+    _merge_coincident_attacks,
     _group_by_line_and_onset,
     _collapse_octave_tremolos,
     compute_dynamics_marks,
@@ -68,6 +69,33 @@ def test_voice_stem_swap_resolves_single_vs_single():
     voice2_pitches = [n.pitch for g in grouped[("RH", 2)] for n in g]
     check(voice1_pitches == [72] and voice2_pitches == [55, 58],
           "voice stem swap: higher single note ends up on voice 1 (up-stem)")
+
+
+def test_merge_coincident_attacks_combines_same_onset_voices_into_one_chord():
+    # 2026-09-08: the "double vision" complaint, confirmed against a real
+    # full-take Dorico render - a fast dense passage where voice 1 and
+    # voice 2 both attack at the identical tick shows as two independent
+    # voices (two stems, two notation-program colors) at that instant,
+    # when it should read as one chord. RH voice 1 has a 2-note chord and
+    # voice 2 a single note, both starting at tick 0; a LATER, genuinely
+    # unrelated voice-2-only attack (tick 480, no voice-1 note there) must
+    # be left alone - only exact-onset coincidences merge.
+    notes = [
+        RawNote(channel_offset=0, pitch=64, velocity=80, start_tick=0, end_tick=480),
+        RawNote(channel_offset=0, pitch=67, velocity=80, start_tick=0, end_tick=480),
+        RawNote(channel_offset=1, pitch=72, velocity=80, start_tick=0, end_tick=480),
+        RawNote(channel_offset=1, pitch=69, velocity=80, start_tick=480, end_tick=960),
+    ]
+    grouped = _group_by_line_and_onset(notes)
+    merged_count = _merge_coincident_attacks(grouped)
+    voice1_groups = grouped[("RH", 1)]
+    voice2_groups = grouped[("RH", 2)]
+    tick0_merged = len(voice1_groups) == 1 and [n.pitch for n in voice1_groups[0]] == [64, 67, 72]
+    voice2_untouched = len(voice2_groups) == 1 and voice2_groups[0][0].pitch == 69 and voice2_groups[0][0].start_tick == 480
+    check(merged_count == 1 and tick0_merged and voice2_untouched,
+          f"merge_coincident_attacks: same-onset voices combine into one chord, "
+          f"unrelated later attack left alone (merged={merged_count}, v1={[[n.pitch for n in g] for g in voice1_groups]}, "
+          f"v2={[[n.pitch for n in g] for g in voice2_groups]})")
 
 
 def test_dynamics_hysteresis_ignores_brief_blip():
@@ -182,18 +210,28 @@ def test_write_midi_merges_voices_and_scales_ticks():
     # Dorico output - music21's MusicXML writer produced useless cross-staff
     # stems, no real up/down-stem voice separation, and almost no logical
     # beaming for this piano-reduction shape. write_midi() bypasses music21's
-    # notation model entirely and writes a plain 2-track (RH/LH) MIDI file,
-    # trusting Dorico's own more mature MIDI-import engine to choose voices/
-    # stems/beaming - trading away <dynamics> marks and explicit lead/
-    # secondary voice tagging, a trade the user explicitly accepted.
+    # notation model entirely and writes a plain MIDI file, trusting Dorico's
+    # own more mature MIDI-import engine to choose voices/stems/beaming -
+    # trading away <dynamics> marks and explicit lead/secondary voice
+    # tagging, a trade the user explicitly accepted.
     #
-    # This test checks two things a silent regression could break: (1) voice
-    # 1 and voice 2 notes on the same hand both land on that hand's single
-    # MIDI channel (the whole point - Dorico re-derives voices on its own),
-    # and (2) notation_scale multiplies tick positions/durations directly
-    # (ticks_per_beat held fixed), the MIDI-domain equivalent of Bitwig's
-    # Content Scaling - simpler than the MusicXML route since there is no
-    # notated-grid model to interact badly with.
+    # 2026-09-08: RH and LH now share ONE content track (channels 0/1) behind
+    # a leading meta-only track, not one track each - live-found that the
+    # previous two-track shape (tracks literally named "RH"/"LH") does NOT
+    # get Dorico's automatic single-piano-instrument recognition at all
+    # (confirmed directly: Import Options showed two separate destination-
+    # instrument slots; assigning "Piano" to both produced two independent
+    # instances, not a shared grand staff). This exact "one meta track + one
+    # multi-channel content track" shape matches OrchCapture's own raw
+    # output, which DOES get recognized correctly.
+    #
+    # This test checks what a silent regression could break: (1) voice 1 and
+    # voice 2 notes on the same hand both land on that hand's single MIDI
+    # channel within the ONE shared track (the whole point - Dorico
+    # re-derives voices on its own), (2) notation_scale multiplies tick
+    # positions/durations directly (ticks_per_beat held fixed), the
+    # MIDI-domain equivalent of Bitwig's Content Scaling, and (3) that scale
+    # also applies to the embedded time-signature tick position.
     tpb = 960
     notes = [
         RawNote(channel_offset=0, pitch=72, velocity=80, start_tick=0, end_tick=480),   # RH voice 1
@@ -204,9 +242,9 @@ def test_write_midi_merges_voices_and_scales_ticks():
 
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "out.mid")
-        write_midi(grouped, tpb, path, notation_scale=2.0)
+        write_midi(grouped, tpb, path, notation_scale=2.0, time_sigs=[(0, "6/8")])
         out = mido.MidiFile(path)
-        by_name = {tr.name: tr for tr in out.tracks}
+        check(len(out.tracks) == 2, f"write_midi: one meta track + one shared content track (got {len(out.tracks)})")
 
         def events(track):
             t = 0
@@ -214,18 +252,20 @@ def test_write_midi_merges_voices_and_scales_ticks():
             for m in track:
                 t += m.time
                 if m.type in ("note_on", "note_off"):
-                    result.append((t, m.type, m.note))
+                    result.append((t, m.type, m.note, m.channel))
             return sorted(result)
 
-        rh = events(by_name["RH"])
-        lh = events(by_name["LH"])
-        # Both RH pitches (voice 1 AND voice 2) must appear on the one RH
-        # track, and every tick must be exactly doubled (scale=2.0).
-        rh_ok = rh == [(0, "note_on", 72), (960, "note_off", 72),
-                        (960, "note_on", 60), (1920, "note_off", 60)]
-        lh_ok = lh == [(0, "note_on", 48), (1920, "note_off", 48)]
-        check(out.ticks_per_beat == tpb and rh_ok and lh_ok,
-              f"write_midi: voices merge per hand and ticks scale exactly (got RH={rh}, LH={lh})")
+        merged = events(out.tracks[1])
+        # RH's two voices (channel 0) AND LH's voice (channel 1) all land in
+        # the ONE content track, ticks doubled (scale=2.0).
+        merged_ok = merged == [(0, "note_on", 48, 1), (0, "note_on", 72, 0),
+                                (960, "note_off", 72, 0), (960, "note_on", 60, 0),
+                                (1920, "note_off", 48, 1), (1920, "note_off", 60, 0)]
+        ts = [m for m in out.tracks[0] if m.type == "time_signature"]
+        ts_ok = len(ts) == 1 and ts[0].numerator == 6 and ts[0].denominator == 8
+        check(out.ticks_per_beat == tpb and merged_ok,
+              f"write_midi: voices merge into one shared track and ticks scale exactly (got {merged})")
+        check(ts_ok, f"write_midi: time signature embedded in the meta track (got {ts})")
 
 
 def test_notation_scale_doubles_offsets_and_durations():
@@ -340,6 +380,7 @@ if __name__ == "__main__":
     test_hand_playability_new_note_owns_extreme()
     test_hand_playability_same_onset_victim_is_dropped_not_zeroed()
     test_voice_stem_swap_resolves_single_vs_single()
+    test_merge_coincident_attacks_combines_same_onset_voices_into_one_chord()
     test_dynamics_hysteresis_ignores_brief_blip()
     test_quantize_does_not_invent_tuplets_from_straight_32nd_notes()
     test_write_midi_merges_voices_and_scales_ticks()

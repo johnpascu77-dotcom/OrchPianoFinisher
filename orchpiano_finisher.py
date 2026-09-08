@@ -500,6 +500,57 @@ def _fix_voice_stem_order(grouped: dict[tuple[str, int], list[list[RawNote]]]) -
               "(the down-stem voice would otherwise have sounded higher).", file=sys.stderr)
 
 
+def _merge_coincident_attacks(grouped: dict[tuple[str, int], list[list[RawNote]]]) -> int:
+    """Notation-only fix (does not touch pitch or hand assignment) for the
+    "double vision" complaint: a fast, dense passage where 2-3 real notes
+    land together across a hand's own voice 1 AND voice 2 at the identical
+    onset tick renders in music21/Dorico as two independent voices stacked
+    at that instant - two separate stems, each in the notation program's own
+    per-voice color - even though it's one simultaneous attack a listener
+    (and a real pianist reading it) hears as one chord. Confirmed directly
+    against a real full-take Dorico render: dense RH runs showed exactly
+    this multi-colored-notehead-at-one-position pattern throughout.
+
+    Voice 1/voice 2 exist to represent two lines with independent RHYTHM
+    (one held while the other moves) - when they happen to attack at the
+    EXACT same instant, there is no rhythmic independence to preserve at
+    that moment, so standard notation practice writes it as a single chord,
+    not two coincident voices. This merges any onset shared exactly between
+    a hand's voice 1 and voice 2 groups into ONE group living in voice 1
+    (up-stem, by convention) - voice 2 loses its own entry for that onset
+    entirely (a rest fills the gap once makeRests runs, same as any other
+    onset that hand's secondary voice doesn't need).
+
+    Harmless for the plain-MIDI path (write_midi() already flattens voice 1
+    and voice 2 back into one line per hand regardless of which group a note
+    sits in - merging changes nothing about the final written notes there),
+    so this can run unconditionally rather than being MusicXML-gated.
+    Mutates `grouped` in place; returns the number of onsets merged."""
+    merged = 0
+    for staff in ("RH", "LH"):
+        key1, key2 = (staff, 1), (staff, 2)
+        if key1 not in grouped or key2 not in grouped:
+            continue
+        groups1, groups2 = grouped[key1], grouped[key2]
+        by_tick1 = {g[0].start_tick: i for i, g in enumerate(groups1)}
+        new_groups2 = []
+        for g2 in groups2:
+            tick = g2[0].start_tick
+            if tick in by_tick1:
+                i1 = by_tick1[tick]
+                groups1[i1] = sorted(groups1[i1] + g2, key=lambda n: n.pitch)
+                merged += 1
+            else:
+                new_groups2.append(g2)
+        groups2[:] = new_groups2
+    if merged:
+        print(f"NOTE: merged {merged} same-onset voice-1/voice-2 attack(s) into a single chord "
+              "(both lines attacking together reads as one chord in real notation, not two "
+              "independent voices - only genuinely independent rhythms keep separate voices).",
+              file=sys.stderr)
+    return merged
+
+
 def _guard_staggered_overlaps(grouped: dict[tuple[str, int], list[list[RawNote]]]) -> None:
     """Narrow hygiene guard, NOT the Phase-2 cross-hand/cross-onset safety
     net: between two DIFFERENT attacks on the same line (never within one
@@ -627,11 +678,12 @@ def _guard_cross_voice_pitch_overlaps(notes: list[RawNote]) -> int:
 
 
 def write_midi(grouped: dict[tuple[str, int], list[list[RawNote]]], ticks_per_beat: int,
-               output_path: str, notation_scale: float = 1.0) -> None:
-    """Write the corrected (post safety-net) note data as a plain 2-track
-    Standard MIDI File - one track per hand (RH channel 0, LH channel 1),
-    voice 1 and voice 2 merged back into one polyphonic line per hand -
-    instead of a music21-built MusicXML score.
+               output_path: str, notation_scale: float = 1.0,
+               time_sigs: list[tuple[int, str]] = ()) -> None:
+    """Write the corrected (post safety-net) note data as a plain Standard
+    MIDI File - RH channel 0, LH channel 1, voice 1 and voice 2 merged back
+    into one polyphonic line per hand - instead of a music21-built MusicXML
+    score.
 
     2026-09-05: added because music21's MusicXML writer produces genuinely
     poor engraving for this piano-reduction shape once tested against a real
@@ -641,11 +693,29 @@ def write_midi(grouped: dict[tuple[str, int], list[list[RawNote]]], ticks_per_be
     (4 channels -> 2 hands, safety-net-corrected note timing) is still the
     valuable part; music21's own notation choices on top of it were not.
     Re-importing a plain MIDI file lets Dorico's own, more mature MIDI-import
-    engine choose voices/stems/beaming itself. Trade-off the user explicitly
-    accepted: no velocity-derived <dynamics> marks (MusicXML-only - raw
-    velocity is still in the file, just not rendered as text) and no
-    explicit lead/secondary voice tagging (merged back into one line per
-    hand; Dorico re-derives voices on its own, same as it would for genuine
+    engine choose voices/stems/beaming itself.
+
+    2026-09-08: BOTH hands now share ONE track (still on separate channels,
+    0/1) instead of one track each, and a leading meta-only track carries
+    the detected time signature(s) - matching the exact 2-track shape
+    (1 meta track + 1 multi-channel content track) OrchCapture's own raw
+    output already uses, which Dorico's MIDI import auto-recognizes as a
+    single piano instrument. The PREVIOUS 2-content-track shape (one track
+    named "RH", one named "LH") does not get that recognition at all -
+    confirmed directly: Dorico's own Import Options showed it as two
+    separate destination-instrument slots, and assigning "Piano" to both
+    produced two independent Piano instances, not one shared grand staff
+    (assigning Treble/Bass clef roles instead ran a different, worse
+    conversion algorithm - the user's own real test, not a guess). This
+    also fixes a related, separately-reported bug: the previous version
+    never wrote a time-signature meta event at all, so any importer
+    defaulted to 4/4 regardless of the capture's own real meter.
+
+    Trade-off the user explicitly accepted for the MIDI path: no
+    velocity-derived <dynamics> marks (MusicXML-only - raw velocity is
+    still in the file, just not rendered as text) and no explicit
+    lead/secondary voice tagging (merged back into one line per hand;
+    Dorico re-derives voices on its own, same as it would for genuine
     performance MIDI).
 
     notation_scale multiplies tick positions/durations directly, ticks_per_beat
@@ -653,9 +723,36 @@ def write_midi(grouped: dict[tuple[str, int], list[list[RawNote]]], ticks_per_be
     (50%/200%) the user originally asked about, and far simpler than the
     MusicXML route's augmentOrDiminish-after-quantize dance: there is no
     notated-grid model here for a pre/post scale order to interact badly
-    with, so a plain integer multiply is exact.
+    with, so a plain integer multiply is exact. Time-signature tick
+    positions are scaled the same way, so a meter change still lands at the
+    right (post-scale) position.
     """
     out = mido.MidiFile(ticks_per_beat=ticks_per_beat)
+
+    meta = mido.MidiTrack()
+    meta.name = "Grand Piano"
+    out.tracks.append(meta)
+    meta_events: list[tuple[int, mido.MetaMessage]] = []
+    for tick, sig in time_sigs:
+        num_str, den_str = sig.split("/")
+        meta_events.append((round(tick * notation_scale),
+                            mido.MetaMessage("time_signature", numerator=int(num_str),
+                                             denominator=int(den_str), time=0)))
+    meta_events.sort(key=lambda e: e[0])
+    last_meta_tick = 0
+    for tick, msg in meta_events:
+        msg.time = max(0, tick - last_meta_tick)
+        last_meta_tick = tick
+        meta.append(msg)
+    meta.append(mido.MetaMessage("end_of_track", time=0))
+
+    # (tick, is_note_on, pitch, channel, velocity) across BOTH hands, one
+    # shared track - sorting is_note_on False before True at an equal tick
+    # lets a note ending exactly when another (on the OTHER hand's channel,
+    # same tick) begins produce a clean off-then-on pair in the merged
+    # stream rather than an arbitrary interleave.
+    events: list[tuple[int, bool, int, int, int]] = []
+    any_notes = False
     for staff, channel in (("RH", 0), ("LH", 1)):
         notes: list[RawNote] = []
         for voice_num in (1, 2):
@@ -663,8 +760,9 @@ def write_midi(grouped: dict[tuple[str, int], list[list[RawNote]]], ticks_per_be
                 notes.extend(group)
         if not notes:
             # Nothing landed on this hand at all (Hands=Left/Right run) - an
-            # empty staff is legitimate, not an error; just skip the track.
+            # empty staff is legitimate, not an error; just skip it.
             continue
+        any_notes = True
 
         cross_voice_truncated = _guard_cross_voice_pitch_overlaps(notes)
         if cross_voice_truncated:
@@ -672,11 +770,6 @@ def write_midi(grouped: dict[tuple[str, int], list[list[RawNote]]], ticks_per_be
                   f"on {staff} before MIDI export (voice 1/voice 2 merge can expose these; "
                   "neither voice's own overlap guard ever sees them alone).", file=sys.stderr)
 
-        # (tick, is_note_on, pitch, velocity) - sorting is_note_on False
-        # before True at an equal tick lets a note ending exactly when
-        # another of the same pitch begins produce a clean off-then-on pair
-        # rather than an ambiguous overlap on one MIDI channel.
-        events: list[tuple[int, bool, int, int]] = []
         for n in notes:
             start = round(n.start_tick * notation_scale)
             end = round(n.end_tick * notation_scale)
@@ -685,16 +778,16 @@ def write_midi(grouped: dict[tuple[str, int], list[list[RawNote]]], ticks_per_be
                 # cross-voice guard truncating right down to its own onset -
                 # nothing audible or notatable to write.
                 continue
-            events.append((start, True, n.pitch, n.velocity))
-            events.append((end, False, n.pitch, 0))
-        if not events:
-            continue
+            events.append((start, True, n.pitch, channel, n.velocity))
+            events.append((end, False, n.pitch, channel, 0))
+
+    if any_notes and events:
         events.sort(key=lambda e: (e[0], e[1]))
         track = mido.MidiTrack()
-        track.name = staff
+        track.name = "Grand Piano"
         out.tracks.append(track)
         last_tick = 0
-        for tick, is_on, pitch, velocity in events:
+        for tick, is_on, pitch, channel, velocity in events:
             delta = tick - last_tick
             last_tick = tick
             track.append(mido.Message("note_on" if is_on else "note_off",
@@ -929,10 +1022,12 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("input_mid", help="Captured MIDI file (e.g. from OrchCapture)")
     ap.add_argument("output_path",
-                     help="Output path. A .mid/.midi extension writes a plain 2-track "
-                          "(RH/LH) Standard MIDI File instead of MusicXML - use this when "
-                          "music21's own notation (stems/voices/beaming) looks worse than "
-                          "letting Dorico's MIDI import decide those on its own; the "
+                     help="Output path. A .mid/.midi extension writes a plain Standard MIDI "
+                          "File (RH/LH on one shared track, channels 0/1, recognized by "
+                          "Dorico's MIDI import as a single piano instrument) instead of "
+                          "MusicXML - use this when music21's own notation (stems/voices/"
+                          "beaming) looks worse than letting Dorico's MIDI import decide "
+                          "those on its own; the "
                           "merge/safety-net corrections still apply either way. Any other "
                           "extension writes MusicXML as before.")
     ap.add_argument("--track", default=None,
@@ -987,14 +1082,18 @@ def main():
     _report_hand_crossing(raw_notes, mid.ticks_per_beat)
 
     grouped = _group_by_line_and_onset(raw_notes)
-    # _fix_voice_stem_order runs BEFORE _guard_staggered_overlaps even on the
-    # MIDI path (which otherwise has no use for stem direction) - it swaps
-    # which onset-groups sit in the voice-1 vs voice-2 bucket, which changes
-    # what _guard_staggered_overlaps considers "the same line" and therefore
-    # what it truncates. write_midi() re-merges both buckets per hand anyway,
-    # so the swap itself is a no-op for the final MIDI notes, but running the
-    # guards in a different order than the MusicXML path would silently
+    # _merge_coincident_attacks runs FIRST - once a shared-onset voice-1/
+    # voice-2 pair is combined into one chord, there is nothing left for
+    # _fix_voice_stem_order to swap at that tick. Both this and
+    # _fix_voice_stem_order run BEFORE _guard_staggered_overlaps even on the
+    # MIDI path (which otherwise has no use for stem direction) - they
+    # change which onset-groups sit in the voice-1 vs voice-2 bucket, which
+    # changes what _guard_staggered_overlaps considers "the same line" and
+    # therefore what it truncates. write_midi() re-merges both buckets per
+    # hand anyway, so neither pass changes the final MIDI notes, but running
+    # the guards in a different order than the MusicXML path would silently
     # change which overlaps get caught.
+    _merge_coincident_attacks(grouped)
     _fix_voice_stem_order(grouped)
     _guard_staggered_overlaps(grouped)
 
@@ -1004,7 +1103,8 @@ def main():
         # is still in the file either way). It also skips the octave-tremolo
         # notation collapse below - real audio playback needs the actual
         # alternating notes, not their two-note notated shorthand.
-        write_midi(grouped, mid.ticks_per_beat, args.output_path, notation_scale=args.notation_scale)
+        write_midi(grouped, mid.ticks_per_beat, args.output_path, notation_scale=args.notation_scale,
+                  time_sigs=time_sigs)
         print(f"Wrote {args.output_path}")
         return
 
