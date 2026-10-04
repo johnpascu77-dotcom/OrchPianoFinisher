@@ -17,6 +17,7 @@ import contextlib
 import io
 import json
 import re
+import shutil
 import threading
 import uuid
 import webbrowser
@@ -32,12 +33,27 @@ ROOT = Path(__file__).resolve().parent
 WORK = ROOT / "ui_workspace"
 INDEX = ROOT / "ui" / "index.html"
 MAX_UPLOAD = 50 * 1024 * 1024
+DEFAULT_SAVE_DIR = Path.home() / "Documents" / "OrchPiano Finisher Output"
 
 _ID_RE = re.compile(r"^[0-9a-f]{12}$")
 _names = {}        # file id -> original stem, for nicer download names
 _out_ext = {}      # output id -> ".mid" | ".musicxml"
 _run_lock = threading.Lock()   # process_capture prints; capture its stdout one run at a time
 _MIME = {".mid": "audio/midi", ".musicxml": "application/vnd.recordare.musicxml+xml"}
+
+
+def save_copy(source, name, folder):
+    """Copy `source` into `folder` (created if needed) as `name`; never overwrite - add _2, _3, ..."""
+    folder = Path(folder).expanduser()
+    folder.mkdir(parents=True, exist_ok=True)
+    safe = re.sub(r'[\/:*?"<>|]', "_", name) or "finished.mid"
+    target = folder / safe
+    n = 2
+    while target.exists():
+        target = folder / f"{Path(safe).stem}_{n}{Path(safe).suffix}"
+        n += 1
+    shutil.copyfile(source, target)
+    return str(target)
 
 
 def _in_path(file_id):
@@ -97,6 +113,8 @@ class Handler(BaseHTTPRequestHandler):
         route = urlparse(self.path).path
         if route == "/":
             self._send(200, INDEX.read_bytes(), "text/html; charset=utf-8")
+        elif route == "/api/config":
+            self._send(200, {"save_dir": str(DEFAULT_SAVE_DIR)})
         elif route.startswith("/api/download/"):
             out_id = route.rsplit("/", 1)[1]
             if not _ID_RE.match(out_id) or out_id not in _out_ext or not _out_path(out_id).exists():
@@ -118,6 +136,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._upload(data)
             elif route == "/api/run":
                 self._run(json.loads(data or b"{}"))
+            elif route == "/api/save":
+                self._save(json.loads(data or b"{}"))
             else:
                 self._error(404, "not found")
         except Exception as exc:
@@ -135,6 +155,16 @@ class Handler(BaseHTTPRequestHandler):
         stem = re.sub(r"[^A-Za-z0-9_.-]", "_", Path(self.headers.get("X-Filename", "capture.mid")).stem) or "capture"
         _names[file_id] = stem
         self._send(200, {"file_id": file_id, "name": stem, **info})
+
+    def _save(self, req):
+        out_id = req.get("out_id", "")
+        folder = (req.get("folder") or "").strip()
+        if not _ID_RE.match(out_id) or out_id not in _out_ext or not _out_path(out_id).exists():
+            return self._error(400, "unknown output; run again")
+        if not folder:
+            return self._error(400, "choose a folder first")
+        name = _names.get(out_id, "finished") + _out_ext[out_id]
+        self._send(200, {"saved": [save_copy(_out_path(out_id), name, folder)]})
 
     def _run(self, req):
         file_id = req.get("file_id", "")
