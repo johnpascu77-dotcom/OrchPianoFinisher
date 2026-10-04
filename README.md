@@ -17,7 +17,7 @@ Opens http://127.0.0.1:8766 . Drop a captured `.mid` on the page; the track, tim
 OrchPiano assumptions are filled in and the Finisher runs at once (press **Run Finisher** after changing
 anything). The result can be downloaded, or dragged straight from the "drag the file out" chip into
 Explorer, Dorico or a DAW (Chrome / Edge write a real file on drop; Firefox does not support this).
-Same options as the desktop GUI; MIDI or MusicXML output. Files live in `ui_workspace/` (gitignored)
+**Save to folder** copies the result into a folder you choose (default `Documents\OrchPiano Finisher Output`, remembered by the page; created if missing, never overwrites - a second save becomes `_2`). Dropping onto Dorico or a DAW from the browser does not work, so this is the reliable way to find results later. Same options as the desktop GUI; MIDI or MusicXML output. Files live in `ui_workspace/` (gitignored)
 and are cleared at each launch.
 
 ## GUI (recommended for trying new pieces)

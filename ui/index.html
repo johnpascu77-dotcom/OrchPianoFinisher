@@ -38,6 +38,12 @@
   <div id="drop"><b>Drop a captured .mid</b> or click to choose<input id="file" type="file" accept=".mid,.midi" hidden></div>
   <div id="fileinfo" class="hint"></div>
 
+  <h2>Save results</h2>
+  <label for="savedir">Folder (created if missing; nothing is overwritten)</label>
+  <input type="text" id="savedir">
+  <button id="savebtn" disabled style="margin-top:6px">Save to folder</button>
+  <div id="saveinfo" class="hint"></div>
+
   <h2>Capture</h2>
   <label for="track">Track</label>
   <select id="track" disabled></select>
@@ -73,7 +79,23 @@
 </main>
 <script>
 const $ = id => document.getElementById(id);
-let fileId = null;
+let fileId = null, outId = null;
+
+(async () => {
+  let dir = '';
+  try { dir = localStorage.getItem('saveDir') || ''; } catch (e) {}
+  if (!dir) dir = (await (await fetch('/api/config')).json()).save_dir;
+  $('savedir').value = dir;
+  $('savedir').onchange = () => { try { localStorage.setItem('saveDir', $('savedir').value.trim()); } catch (e) {} };
+  $('savebtn').onclick = async () => {
+    if (!outId) return;
+    try { localStorage.setItem('saveDir', $('savedir').value.trim()); } catch (e) {}
+    const d = await (await fetch('/api/save', { method: 'POST', body: JSON.stringify({ out_id: outId, folder: $('savedir').value }) })).json();
+    if (d.error) return setStatus(d.error, true);
+    $('saveinfo').textContent = 'Saved: ' + d.saved.join(' ; ');
+    setStatus('Saved.');
+  };
+})();
 
 function setStatus(t, err) { $('status').textContent = t; $('status').classList.toggle('err', !!err); }
 
@@ -100,7 +122,7 @@ async function upload(file) {
   if (d.auto_track !== null) run();
 }
 
-function hideResult() { $('dragchip').style.display = 'none'; $('dlink').style.display = 'none'; }
+function hideResult() { outId = null; $('savebtn').disabled = true;  $('dragchip').style.display = 'none'; $('dlink').style.display = 'none'; }
 
 async function run() {
   if (!fileId) return;
@@ -117,6 +139,7 @@ async function run() {
   $('log').textContent = d.log || d.error || '';
   if (!d.ok) return setStatus('The Finisher stopped — see the log.', true);
   setStatus(`${d.download_name} — ${(d.bytes / 1024).toFixed(1)} KB`);
+  outId = d.out_id; $('savebtn').disabled = false;
   const href = '/api/download/' + d.out_id;
   const a = $('dlink'); a.href = href; a.download = d.download_name; a.style.display = '';
   const chip = $('dragchip'); chip.style.display = 'inline-block'; chip.draggable = true;
