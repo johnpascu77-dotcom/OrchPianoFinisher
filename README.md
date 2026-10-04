@@ -7,6 +7,19 @@ or a MusicXML score, applying a real-time-only safety net OrchPiano's own stream
 MIDI - merging both hands onto a single track/channel so Dorico's own import recognizes it as one
 piano instrument instead of two).
 
+## Browser UI (drag and drop in, drag out)
+
+```
+python finisher_html_ui.py        # or double-click "Launch Finisher HTML UI.bat"
+```
+
+Opens http://127.0.0.1:8766 . Drop a captured `.mid` on the page; the track, time signature and
+OrchPiano assumptions are filled in and the Finisher runs at once (press **Run Finisher** after changing
+anything). The result can be downloaded, or dragged straight from the "drag the file out" chip into
+Explorer, Dorico or a DAW (Chrome / Edge write a real file on drop; Firefox does not support this).
+Same options as the desktop GUI; MIDI or MusicXML output. Files live in `ui_workspace/` (gitignored)
+and are cleared at each launch.
+
 ## GUI (recommended for trying new pieces)
 
 ```
